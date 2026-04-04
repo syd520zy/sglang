@@ -770,6 +770,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         content,
                         request,
                         has_tool_calls,
+                        continuous_usage_stats,
                     ):
                         if chunk:
                             yield chunk
@@ -1313,6 +1314,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
+        continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -1335,11 +1337,6 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
-
-        _, continuous_usage_stats = should_include_usage(
-            request.stream_options,
-            self.tokenizer_manager.server_args.stream_response_default_include_usage,
-        )
 
         # Yield normal text
         if normal_text:
