@@ -374,7 +374,7 @@ class ServerArgs:
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
-    enable_force_include_usage: bool = False
+    stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
@@ -4139,10 +4139,10 @@ class ServerArgs:
             help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
-            "--enable-force-include-usage",
+            "--stream-response-default-include-usage",
             action="store_true",
-            help="If set to True, include usage on every request "
-            "(even when stream_options is not specified)",
+            help="Include usage in every streaming response "
+            "(even when stream_options is not specified).",
         )
         parser.add_argument(
             "--stream-output",

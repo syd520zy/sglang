@@ -75,14 +75,19 @@ def process_hidden_states_from_ret(
 
 
 def should_include_usage(
-    stream_options: StreamOptions | None, enable_force_include_usage: bool
+    stream_options: StreamOptions | None, stream_response_default_include_usage: bool
 ) -> tuple[bool, bool]:
     # When stream_options are specified in the request
     if stream_options:
-        include_usage = stream_options.include_usage or enable_force_include_usage
+        include_usage = (
+            stream_options.include_usage or stream_response_default_include_usage
+        )
         continuous_usage_stats = bool(stream_options.continuous_usage_stats)
     else:
-        include_usage, continuous_usage_stats = enable_force_include_usage, False
+        include_usage, continuous_usage_stats = (
+            stream_response_default_include_usage,
+            False,
+        )
     return include_usage, continuous_usage_stats
 
 
