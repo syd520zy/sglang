@@ -1336,7 +1336,7 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
 
-        include_usage, continuous_usage_stats = should_include_usage(
+        _, continuous_usage_stats = should_include_usage(
             request.stream_options,
             self.tokenizer_manager.server_args.stream_response_default_include_usage,
         )
