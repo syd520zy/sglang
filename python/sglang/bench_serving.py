@@ -287,16 +287,20 @@ async def async_request_openai_completions(
                             continue
 
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
                         if chunk == "[DONE]":
                             pass
                         else:
                             data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # Some providers may emit meta/usage chunks without
+                            # "choices". Keep parsing robust and only consume
+                            # token chunks when text is present.
+                            choices = data.get("choices") or []
+                            token_text = ""
+                            if choices and isinstance(choices[0], dict):
+                                token_text = choices[0].get("text", "")
+
+                            if token_text:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -305,21 +309,22 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(token_text)
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                generated_text += token_text
+
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
 
                     output.generated_text = generated_text
                     output.success = True
-                    output.latency = latency
+                    output.latency = time.perf_counter() - st
                     output.output_len = output_len
+                    if output.ttft == 0.0 and output.output_len and output.latency:
+                        output.ttft = output.latency
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -461,11 +466,15 @@ async def async_request_openai_chat_completions(
                             else:
                                 data = json.loads(chunk)
 
-                                # Check if this chunk contains content
+                                # Check if this chunk contains token text.
+                                # Some reasoning models stream `reasoning_content`
+                                # before/without `content`.
                                 delta = data.get("choices", [{}])[0].get("delta", {})
                                 content = delta.get("content", "")
+                                reasoning_content = delta.get("reasoning_content", "")
+                                token_text = content or reasoning_content
 
-                                if content:
+                                if token_text:
                                     timestamp = time.perf_counter()
                                     # First token
                                     if ttft == 0.0:
@@ -474,13 +483,13 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
-                                        output.text_chunks.append(content)
+                                        output.text_chunks.append(token_text)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
 
                                     most_recent_timestamp = timestamp
-                                    generated_text += content
+                                    generated_text += token_text
 
                                 # Check for usage info in final chunk
                                 output_len = (data.get("usage") or {}).get(
@@ -491,6 +500,11 @@ async def async_request_openai_chat_completions(
                         output.success = True
                         output.latency = latency
                         output.output_len = output_len
+                        # Fallback for providers/chunks where text fields are not
+                        # exposed in streamed deltas: keep TTFT non-zero so TPOT
+                        # statistics do not collapse to invalid zeros.
+                        if output.ttft == 0.0 and output.output_len and output.latency:
+                            output.ttft = output.latency
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())

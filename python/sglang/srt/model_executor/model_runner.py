@@ -763,6 +763,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
         if (
+            server_args.attention_backend == "triattention"
+            or server_args.decode_attention_backend == "triattention"
+        ) and not server_args.disable_cuda_graph:
+            server_args.disable_cuda_graph = True
+            logger.info(
+                "TriAttention backend currently applies sparse decode indices in non-cuda-graph path only. "
+                "Automatically enabling --disable-cuda-graph."
+            )
+
+        if (
             not self.use_mla_backend
             or server_args.attention_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS

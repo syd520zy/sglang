@@ -125,6 +125,7 @@ SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
+    "triattention",
     "torch_native",
     "flex_attention",
     "nsa",
@@ -469,6 +470,10 @@ class ServerArgs:
     attention_backend: Optional[str] = None
     decode_attention_backend: Optional[str] = None
     prefill_attention_backend: Optional[str] = None
+    enable_triattention: bool = False
+    triattention_window_size: int = 128
+    triattention_notable_budget: int = 256
+    triattention_selection_interval: int = 32
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
@@ -4542,6 +4547,30 @@ class ServerArgs:
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
+            "--enable-triattention",
+            action="store_true",
+            default=ServerArgs.enable_triattention,
+            help="Enable TriAttention-style sparse decode attention routing.",
+        )
+        parser.add_argument(
+            "--triattention-window-size",
+            type=int,
+            default=ServerArgs.triattention_window_size,
+            help="Always-keep dense local attention window size for TriAttention.",
+        )
+        parser.add_argument(
+            "--triattention-notable-budget",
+            type=int,
+            default=ServerArgs.triattention_notable_budget,
+            help="Number of remotely selected notable tokens for TriAttention.",
+        )
+        parser.add_argument(
+            "--triattention-selection-interval",
+            type=int,
+            default=ServerArgs.triattention_selection_interval,
+            help="Re-selection interval (decode steps) for notable tokens in TriAttention.",
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=SAMPLING_BACKEND_CHOICES,
@@ -5833,9 +5862,24 @@ class ServerArgs:
         args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+        # Backward compatibility: --stream-output now maps to
+        # incremental_streaming_output, while the dataclass still keeps
+        # stream_output for old call paths.
+        if not hasattr(args, "stream_output"):
+            args.stream_output = getattr(args, "incremental_streaming_output", False)
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        kwargs = {}
+        for field in dataclasses.fields(cls):
+            if hasattr(args, field.name):
+                kwargs[field.name] = getattr(args, field.name)
+            elif field.default is not dataclasses.MISSING:
+                kwargs[field.name] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                kwargs[field.name] = field.default_factory()
+            else:
+                raise AttributeError(f"Missing required CLI arg: {field.name}")
+
+        return cls(**kwargs)
 
     def url(self):
         scheme = "https" if self.ssl_certfile else "http"

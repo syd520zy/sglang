@@ -102,6 +102,15 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
+@register_attention_backend("triattention")
+def create_triattention_backend(runner):
+    from sglang.srt.layers.attention.triattention_backend import (
+        TriAttentionTritonBackend,
+    )
+
+    return TriAttentionTritonBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
