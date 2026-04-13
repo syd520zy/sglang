@@ -79,6 +79,8 @@ class SchedulerStats:
     # Basics
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
+    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
+    # not just KV token usage. Rename requires API deprecation.
     token_usage: float = 0.0
     full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -130,6 +132,10 @@ class SchedulerStats:
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
 
+    # Streaming session metrics
+    num_streaming_sessions: int = 0
+    streaming_session_held_tokens: int = 0
+
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
@@ -174,6 +180,7 @@ class SchedulerMetricsCollector:
         labels: Dict[str, str],
         enable_lora: bool = False,
         enable_hierarchical_cache: bool = False,
+        enable_streaming_session: bool = False,
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -182,6 +189,7 @@ class SchedulerMetricsCollector:
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
+        self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
 
@@ -652,6 +660,21 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        # Streaming session metrics (only created when streaming sessions are enabled)
+        if self.enable_streaming_session:
+            self.num_streaming_sessions = Gauge(
+                name="sglang:num_streaming_sessions",
+                documentation="The number of active streaming sessions.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.streaming_session_held_tokens = Gauge(
+                name="sglang:streaming_session_held_tokens",
+                documentation="The number of KV tokens currently held by streaming session slots.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -701,6 +724,30 @@ class SchedulerMetricsCollector:
                 "the CPU schedule stream (overlap bubble)."
             ),
             labelnames=list(labels.keys()) + ["category"],
+        )
+        self.estimated_flops_per_gpu_total = Counter(
+            name="sglang:estimated_flops_per_gpu_total",
+            documentation=(
+                "Estimated number of floating point operations per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.estimated_read_bytes_per_gpu_total = Counter(
+            name="sglang:estimated_read_bytes_per_gpu_total",
+            documentation=(
+                "Estimated number of bytes read from memory per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.estimated_write_bytes_per_gpu_total = Counter(
+            name="sglang:estimated_write_bytes_per_gpu_total",
+            documentation=(
+                "Estimated number of bytes written to memory per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
         )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
@@ -928,6 +975,25 @@ class SchedulerMetricsCollector:
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
 
+    def increment_estimated_perf(
+        self,
+        num_flops_per_gpu: float = 0.0,
+        num_read_bytes_per_gpu: float = 0.0,
+        num_write_bytes_per_gpu: float = 0.0,
+    ) -> None:
+        if num_flops_per_gpu > 0:
+            self.estimated_flops_per_gpu_total.labels(**self.labels).inc(
+                num_flops_per_gpu
+            )
+        if num_read_bytes_per_gpu > 0:
+            self.estimated_read_bytes_per_gpu_total.labels(**self.labels).inc(
+                num_read_bytes_per_gpu
+            )
+        if num_write_bytes_per_gpu > 0:
+            self.estimated_write_bytes_per_gpu_total.labels(**self.labels).inc(
+                num_write_bytes_per_gpu
+            )
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -1002,6 +1068,13 @@ class SchedulerMetricsCollector:
             )
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
+            )
+
+        # Streaming session metrics (only logged if streaming sessions are enabled)
+        if self.enable_streaming_session:
+            self._log_gauge(self.num_streaming_sessions, stats.num_streaming_sessions)
+            self._log_gauge(
+                self.streaming_session_held_tokens, stats.streaming_session_held_tokens
             )
 
         self._log_gauge(

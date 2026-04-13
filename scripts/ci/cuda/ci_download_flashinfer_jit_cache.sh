@@ -5,7 +5,7 @@
 # Required environment (caller must export or set):
 #   UNINSTALL_JIT_CACHE          — literal true/false (skip download when false)
 #   FLASHINFER_PYTHON_REQUIRED   — e.g. from python/pyproject.toml (flashinfer_python)
-#   CU_VERSION                   — e.g. cu129
+#   CU_VERSION                   — e.g. cu130
 #   PIP_CMD                      — e.g. "pip" or "uv pip"
 #   PIP_INSTALL_SUFFIX           — extra pip args for this runner
 set -euxo pipefail
@@ -24,8 +24,6 @@ fi
 if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
     FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
     mkdir -p "${FLASHINFER_CACHE_DIR}"
-
-    find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flashinfer_jit_cache-${FLASHINFER_PYTHON_REQUIRED}*" -type f -delete 2>/dev/null || true
 
     FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_PYTHON_REQUIRED}*.whl"
     CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
