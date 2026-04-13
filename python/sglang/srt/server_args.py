@@ -781,6 +781,7 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        self._handle_triattention_enable_flag()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
@@ -2406,6 +2407,27 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+    def _handle_triattention_enable_flag(self):
+        """Map --enable-triattention to decode backend selection."""
+        if not self.enable_triattention:
+            return
+
+        if self.decode_attention_backend is None:
+            if self.attention_backend != "triattention":
+                self.decode_attention_backend = "triattention"
+                logger.info(
+                    "--enable-triattention is set; using triattention as decode attention backend."
+                )
+            return
+
+        if self.decode_attention_backend != "triattention":
+            logger.warning(
+                "--enable-triattention is set but decode attention backend is '%s'. "
+                "Keeping the explicit decode backend; set --decode-attention-backend triattention "
+                "to enable TriAttention decode path.",
+                self.decode_attention_backend,
+            )
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
