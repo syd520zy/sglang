@@ -29,6 +29,8 @@ set -euo pipefail
 #   OUTPUT_ROOT=benchmark/context_compare
 #   CONCURRENCIES=1,10,20
 #   REQUEST_MULTIPLIER=10
+#   LIVE_BENCH_LOG=1
+#   COLLECT_OUTPUT_DETAILS=0
 #   BENCH_EXTRA_ARGS="--warmup-requests 2"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,6 +45,8 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-benchmark/context_compare}"
 BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
 CONCURRENCIES="${CONCURRENCIES:-1,10,20}"
 REQUEST_MULTIPLIER="${REQUEST_MULTIPLIER:-10}"
+LIVE_BENCH_LOG="${LIVE_BENCH_LOG:-1}"
+COLLECT_OUTPUT_DETAILS="${COLLECT_OUTPUT_DETAILS:-0}"
 
 # Enforce concurrency-driven test mode.
 if [[ "${BENCH_EXTRA_ARGS}" == *"--request-rate"* ]]; then
@@ -83,6 +87,14 @@ wait_for_server_ready() {
 run_benchmark_matrix() {
   local out_dir="$1"
   local run_label="$2"
+  local live_log_args=""
+  local output_details_args=""
+  if [[ "${LIVE_BENCH_LOG}" == "1" ]]; then
+    live_log_args="--live-log"
+  fi
+  if [[ "${COLLECT_OUTPUT_DETAILS}" == "1" ]]; then
+    output_details_args="--output-details"
+  fi
   echo "[INFO] Running benchmark matrix for ${run_label} ..."
   "${PYTHON_BIN}" scripts/playground/auto_context_compare.py \
     --mode run \
@@ -94,6 +106,8 @@ run_benchmark_matrix() {
     --request-multiplier "${REQUEST_MULTIPLIER}" \
     --request-rate inf \
     --output-dir "${out_dir}" \
+    ${live_log_args} \
+    ${output_details_args} \
     ${BENCH_EXTRA_ARGS}
 }
 

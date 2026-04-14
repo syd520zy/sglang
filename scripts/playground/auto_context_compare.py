@@ -221,6 +221,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print commands only, do not execute benchmark (run mode).",
     )
+    parser.add_argument(
+        "--live-log",
+        action="store_true",
+        help=(
+            "Stream bench_serving stdout/stderr to terminal while still writing "
+            "full logs to files (run mode)."
+        ),
+    )
+    parser.add_argument(
+        "--output-details",
+        action="store_true",
+        help=(
+            "Forward --output-details to bench_serving so per-request arrays "
+            "(ttfts/itls/errors) are included in raw JSONL outputs (run mode)."
+        ),
+    )
 
     # A/B compare mode args.
     parser.add_argument(
@@ -352,24 +368,37 @@ def build_bench_cmd(
         cmd.append("--disable-stream")
     if args.flush_cache:
         cmd.append("--flush-cache")
+    if args.output_details:
+        cmd.append("--output-details")
 
     return cmd
 
 
-def run_command(cmd: List[str], log_file: Path, dry_run: bool) -> None:
+def run_command(cmd: List[str], log_file: Path, dry_run: bool, live_log: bool) -> None:
     command_str = " ".join(cmd)
     print(f"[RUN] {command_str}")
     if dry_run:
         return
 
-    completed = subprocess.run(cmd, text=True, capture_output=True)
-    log_file.write_text(
-        f"COMMAND:\n{command_str}\n\nSTDOUT:\n{completed.stdout}\n\nSTDERR:\n{completed.stderr}\n",
-        encoding="utf-8",
-    )
-    if completed.returncode != 0:
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(f"COMMAND:\n{command_str}\n\nOUTPUT:\n")
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            f.write(line)
+            if live_log:
+                print(line, end="")
+        returncode = process.wait()
+
+    if returncode != 0:
         raise RuntimeError(
-            f"Command failed with exit code {completed.returncode}. See log: {log_file}"
+            f"Command failed with exit code {returncode}. See log: {log_file}"
         )
 
 
@@ -706,7 +735,7 @@ def run_mode(args: argparse.Namespace) -> None:
         raw_file = output_dir / "raw" / f"{case_name}.jsonl"
         log_file = output_dir / "logs" / f"{case_name}.log"
         cmd = build_bench_cmd(args, case, raw_file)
-        run_command(cmd, log_file, args.dry_run)
+        run_command(cmd, log_file, args.dry_run, args.live_log)
         if args.dry_run:
             continue
         result = load_last_jsonl_record(raw_file)
