@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -34,6 +35,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
+_use_csattention = get_bool_env_var("SGLANG_NSA_USE_CSATTENTION", "false")
 if _is_cuda:
     try:
         import deep_gemm
@@ -238,6 +240,21 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        # Experimental CSAttention-like retrieval (GPU decode-only).
+        # Toggle with SGLANG_NSA_USE_CSATTENTION=1.
+        self.use_csattention = _is_cuda and _use_csattention
+        self.cs_chunk_size = max(1, get_int_env_var("SGLANG_NSA_CS_CHUNK_SIZE", 64))
+        self.cs_num_groups = max(1, get_int_env_var("SGLANG_NSA_CS_NUM_GROUPS", 32))
+        self.cs_group_topk = max(1, get_int_env_var("SGLANG_NSA_CS_GROUP_TOPK", 8))
+        self.cs_chunk_topk_mult = max(
+            1, get_int_env_var("SGLANG_NSA_CS_CHUNK_TOPK_MULT", 4)
+        )
+        self.cs_recent_tokens = max(
+            0, get_int_env_var("SGLANG_NSA_CS_RECENT_TOKENS", 256)
+        )
+        self.cs_min_seq_len = max(
+            0, get_int_env_var("SGLANG_NSA_CS_MIN_SEQ_LEN", 4096)
+        )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -521,6 +538,162 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
+
+    def _csattention_local_topk(
+        self,
+        query: torch.Tensor,
+        head_weights: torch.Tensor,
+        keys: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Two-stage chunk retrieval for decode-time top-k selection."""
+        if seq_len <= 0:
+            return torch.empty(0, dtype=torch.int32, device=query.device)
+
+        keys = keys[:seq_len]
+        weighted_query = (query.float() * head_weights.float().unsqueeze(-1)).sum(dim=0)
+
+        # For shorter contexts, exact scoring is usually cheaper and more stable.
+        if seq_len <= self.cs_min_seq_len:
+            scores = keys @ weighted_query
+            k = min(self.index_topk, seq_len)
+            return scores.topk(k, dim=-1).indices.to(torch.int32)
+
+        chunk_size = self.cs_chunk_size
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        pad_tokens = num_chunks * chunk_size - seq_len
+
+        if pad_tokens > 0:
+            pad = torch.zeros(
+                (pad_tokens, keys.shape[1]), dtype=keys.dtype, device=keys.device
+            )
+            padded_keys = torch.cat([keys, pad], dim=0)
+        else:
+            padded_keys = keys
+
+        chunk_view = padded_keys.view(num_chunks, chunk_size, -1)
+        chunk_means = chunk_view.mean(dim=1)
+        if pad_tokens > 0:
+            valid_last = chunk_size - pad_tokens
+            chunk_means[-1] = chunk_view[-1, :valid_last].mean(dim=0)
+
+        chunk_scores = chunk_means @ weighted_query
+
+        num_groups = min(self.cs_num_groups, num_chunks)
+        group_size = (num_chunks + num_groups - 1) // num_groups
+        chunk_ids = torch.arange(num_chunks, device=keys.device, dtype=torch.int64)
+        group_ids = torch.div(chunk_ids, group_size, rounding_mode="floor")
+        num_groups = int(group_ids[-1].item()) + 1
+
+        group_scores = torch.full(
+            (num_groups,), float("-inf"), dtype=chunk_scores.dtype, device=keys.device
+        )
+        group_scores.scatter_reduce_(
+            0, group_ids, chunk_scores, reduce="amax", include_self=True
+        )
+        top_groups = group_scores.topk(min(self.cs_group_topk, num_groups), dim=-1).indices
+        selected_mask = (group_ids.unsqueeze(1) == top_groups.unsqueeze(0)).any(dim=1)
+        candidate_chunks = torch.nonzero(selected_mask, as_tuple=False).squeeze(-1)
+
+        # Limit candidate chunks to keep exact scoring bounded.
+        chunk_budget = min(
+            num_chunks,
+            max(
+                (self.index_topk + chunk_size - 1) // chunk_size,
+                self.cs_group_topk * self.cs_chunk_topk_mult,
+            ),
+        )
+        if candidate_chunks.numel() > chunk_budget:
+            cand_scores = chunk_scores[candidate_chunks]
+            top_local = cand_scores.topk(chunk_budget, dim=-1).indices
+            candidate_chunks = candidate_chunks[top_local]
+
+        token_offsets = torch.arange(chunk_size, device=keys.device, dtype=torch.int64)
+        candidate_tokens = (
+            candidate_chunks.unsqueeze(1) * chunk_size + token_offsets.unsqueeze(0)
+        ).reshape(-1)
+        candidate_tokens = candidate_tokens[candidate_tokens < seq_len]
+
+        if self.cs_recent_tokens > 0:
+            recent_start = max(0, seq_len - self.cs_recent_tokens)
+            recent_tokens = torch.arange(
+                recent_start, seq_len, device=keys.device, dtype=torch.int64
+            )
+            candidate_tokens = torch.cat([candidate_tokens, recent_tokens], dim=0)
+
+        candidate_tokens = torch.unique(candidate_tokens, sorted=False)
+        if candidate_tokens.numel() == 0:
+            return torch.empty(0, dtype=torch.int32, device=keys.device)
+
+        candidate_scores = keys.index_select(0, candidate_tokens) @ weighted_query
+        k = min(self.index_topk, candidate_tokens.numel())
+        top_candidates = candidate_scores.topk(k, dim=-1).indices
+        return candidate_tokens[top_candidates].to(torch.int32)
+
+    def _get_topk_csattention_decode(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        if TYPE_CHECKING:
+            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        assert page_size == 64, "CSAttention decode path currently assumes page size 64."
+
+        block_tables_64 = metadata.get_page_table_64()
+        block_tables_1 = metadata.get_page_table_1()
+        seq_lens = metadata.get_seqlens_int32()
+        q_rows = min(query.shape[0], weights.shape[0], block_tables_64.shape[0])
+
+        topk_result = torch.full(
+            (query.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        if q_rows == 0:
+            return topk_result
+
+        fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+
+        for i in range(q_rows):
+            seq_len = int(seq_lens[i].item())
+            if seq_len <= 0:
+                continue
+
+            page_indices = block_tables_64[i]
+            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
+                layer_id, seq_len, page_indices
+            )
+            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+                layer_id, seq_len, page_indices
+            )
+
+            keys = k_fp8.view(fp8_dtype).to(torch.float32)
+            scales = k_scale.view(torch.float32).squeeze(-1).unsqueeze(-1)
+            keys = keys * scales
+
+            local_topk = self._csattention_local_topk(
+                query=query[i],
+                head_weights=weights[i],
+                keys=keys,
+                seq_len=seq_len,
+            )
+            if local_topk.numel() == 0:
+                continue
+
+            k = min(self.index_topk, local_topk.numel())
+            if envs.SGLANG_NSA_FUSE_TOPK.get():
+                mapped = block_tables_1[i].index_select(0, local_topk[:k].to(torch.int64))
+                topk_result[i, :k] = mapped.to(torch.int32)
+            else:
+                topk_result[i, :k] = local_topk[:k]
+
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -1200,6 +1373,23 @@ class Indexer(MultiPlatformOp):
                     -1,
                     dtype=torch.int,
                     device=x_meta.device,
+                )
+
+            if (
+                self.use_csattention
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and _is_cuda
+            ):
+                if weights.ndim == 3:
+                    weights_for_cs = weights.squeeze(-1)
+                else:
+                    weights_for_cs = weights
+                return self._get_topk_csattention_decode(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    query=query,
+                    weights=weights_for_cs,
+                    metadata=metadata,
                 )
 
             if (
