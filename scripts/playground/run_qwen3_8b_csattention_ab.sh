@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-click A/B benchmark for Qwen3-8B:
-# 1) baseline server (CSAttention=0) + benchmark
-# 2) stop server with `pkill -9 python`
-# 3) csattention server (CSAttention=1) + benchmark
-# 4) compare-ab report
+# Benchmark + compare only (no server start/stop).
+#
+# Flow:
+# 1) Verify current running server is reachable; run baseline benchmark.
+# 2) Pause and ask user to manually restart server with CSAttention enabled.
+# 3) Verify server is reachable again; run csattention benchmark.
+# 4) Generate A/B comparison files.
 #
 # Usage:
 #   bash scripts/playground/run_qwen3_8b_csattention_ab.sh
+#
+# Manual server startup examples:
+#   # baseline
+#   SGLANG_NSA_USE_CSATTENTION=0 python -m sglang.launch_server \
+#     --model-path /model/ModelScope/Qwen/Qwen3-8B --host 127.0.0.1 --port 30000
+#
+#   # csattention
+#   SGLANG_NSA_USE_CSATTENTION=1 python -m sglang.launch_server \
+#     --model-path /model/ModelScope/Qwen/Qwen3-8B --host 127.0.0.1 --port 30000
 #
 # Optional env overrides:
 #   MODEL_PATH=/model/ModelScope/Qwen/Qwen3-8B
@@ -18,7 +29,6 @@ set -euo pipefail
 #   OUTPUT_ROOT=benchmark/context_compare
 #   CONCURRENCIES=1,10,20
 #   REQUEST_MULTIPLIER=10
-#   SERVER_EXTRA_ARGS="--tp 1"
 #   BENCH_EXTRA_ARGS="--warmup-requests 2"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +40,6 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-benchmark/context_compare}"
-SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
 BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
 CONCURRENCIES="${CONCURRENCIES:-1,10,20}"
 REQUEST_MULTIPLIER="${REQUEST_MULTIPLIER:-10}"
@@ -47,16 +56,12 @@ RUN_ROOT="${OUTPUT_ROOT}/qwen3_8b_csattention_ab_${TIMESTAMP}"
 BASELINE_DIR="${RUN_ROOT}/baseline_gpu"
 CSATTN_DIR="${RUN_ROOT}/csattention_gpu"
 AB_DIR="${RUN_ROOT}/ab_compare"
-LOG_DIR="${RUN_ROOT}/logs"
-mkdir -p "${BASELINE_DIR}" "${CSATTN_DIR}" "${AB_DIR}" "${LOG_DIR}"
-
-BASELINE_SERVER_LOG="${LOG_DIR}/server_baseline.log"
-CSATTN_SERVER_LOG="${LOG_DIR}/server_csattention.log"
+mkdir -p "${BASELINE_DIR}" "${CSATTN_DIR}" "${AB_DIR}"
 
 wait_for_server_ready() {
   local host="$1"
   local port="$2"
-  local timeout_sec="${3:-900}"
+  local timeout_sec="${3:-300}"
   local start_ts now elapsed
   start_ts="$(date +%s)"
   while true; do
@@ -73,35 +78,6 @@ wait_for_server_ready() {
     fi
     sleep 2
   done
-}
-
-stop_server() {
-  set +e
-  pkill -9 python >/dev/null 2>&1
-  set -e
-  sleep 3
-}
-
-start_server() {
-  local csattn_flag="$1"
-  local log_file="$2"
-
-  stop_server
-  echo "[INFO] Launching server with SGLANG_NSA_USE_CSATTENTION=${csattn_flag} ..."
-  SGLANG_NSA_USE_CSATTENTION="${csattn_flag}" \
-    "${PYTHON_BIN}" -m sglang.launch_server \
-      --model-path "${MODEL_PATH}" \
-      --host "${HOST}" \
-      --port "${PORT}" \
-      ${SERVER_EXTRA_ARGS} \
-      > "${log_file}" 2>&1 &
-
-  if ! wait_for_server_ready "${HOST}" "${PORT}" 900; then
-    echo "[ERROR] Server did not become ready in time. Log tail:"
-    tail -n 80 "${log_file}" || true
-    exit 1
-  fi
-  echo "[INFO] Server is ready."
 }
 
 run_benchmark_matrix() {
@@ -131,22 +107,34 @@ run_ab_compare() {
     --ab-output-dir "${AB_DIR}"
 }
 
-cleanup() {
-  echo "[INFO] Cleanup: stopping python server(s) with pkill -9 python"
-  stop_server
-}
-trap cleanup EXIT
-
 echo "[INFO] Repo root: ${REPO_ROOT}"
 echo "[INFO] Model path: ${MODEL_PATH}"
+echo "[INFO] Host/Port: ${HOST}:${PORT}"
 echo "[INFO] Output root: ${RUN_ROOT}"
-
-start_server "0" "${BASELINE_SERVER_LOG}"
+echo
+echo "[STEP 1/4] Ensure baseline server is already running with:"
+echo "  SGLANG_NSA_USE_CSATTENTION=0"
+if ! wait_for_server_ready "${HOST}" "${PORT}" 300; then
+  echo "[ERROR] Baseline server not reachable at http://${HOST}:${PORT}."
+  exit 1
+fi
 run_benchmark_matrix "${BASELINE_DIR}" "baseline"
 
-start_server "1" "${CSATTN_SERVER_LOG}"
+echo
+echo "[STEP 2/4] Please stop baseline server and start csattention server with:"
+echo "  SGLANG_NSA_USE_CSATTENTION=1"
+echo "Press Enter to continue after server is ready..."
+read -r _
+
+echo "[STEP 3/4] Verifying csattention server ..."
+if ! wait_for_server_ready "${HOST}" "${PORT}" 300; then
+  echo "[ERROR] CSAttention server not reachable at http://${HOST}:${PORT}."
+  exit 1
+fi
 run_benchmark_matrix "${CSATTN_DIR}" "csattention"
 
+echo
+echo "[STEP 4/4] Building A/B report ..."
 run_ab_compare
 
 echo
