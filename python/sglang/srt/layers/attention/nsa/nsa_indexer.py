@@ -263,6 +263,12 @@ class Indexer(MultiPlatformOp):
             1, get_int_env_var("SGLANG_NSA_CSATTENTION_DEBUG_MAX_LOGS", 20)
         )
         self.cs_debug_log_count = 0
+        self.cs_graph_capture_fallback_logged = False
+        # Phase-2 toggle: enable NPU CSAttention path during graph capture.
+        # Keep disabled by default until capture safety is validated per env/model stack.
+        self.cs_npu_enable_capture = get_bool_env_var(
+            "SGLANG_NSA_CSATTENTION_NPU_ENABLE_CAPTURE", "false"
+        )
         if self.cs_debug:
             _logger.info(
                 "NSA CSAttention debug enabled: use_csattention=%s layer_id=%s topk=%s "
@@ -279,6 +285,11 @@ class Indexer(MultiPlatformOp):
                 self.cs_min_seq_len,
                 self.cs_debug_max_logs,
             )
+            if _is_npu:
+                _logger.info(
+                    "NSA CSAttention NPU capture mode enabled=%s",
+                    self.cs_npu_enable_capture,
+                )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -742,17 +753,139 @@ class Indexer(MultiPlatformOp):
 
         return topk_result
 
-    def _gather_npu_index_keys(
+    def _gather_npu_index_keys_full(
         self,
         past_key_states: torch.Tensor,
         block_table_row: torch.Tensor,
-        seq_len: int,
         page_size: int,
     ) -> torch.Tensor:
-        token_idx = torch.arange(seq_len, device=block_table_row.device, dtype=torch.long)
+        max_seq_len = block_table_row.shape[0] * page_size
+        token_idx = torch.arange(
+            max_seq_len, device=block_table_row.device, dtype=torch.long
+        )
         page_ids = block_table_row[token_idx // page_size].to(torch.long)
         page_offsets = (token_idx % page_size).to(torch.long)
         return past_key_states[page_ids, page_offsets, 0, :].to(torch.float32)
+
+    def _csattention_local_topk_npu_graphsafe(
+        self,
+        query: torch.Tensor,
+        head_weights: torch.Tensor,
+        keys_full: torch.Tensor,
+        seq_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """Graph-capture friendly NPU decode top-k selection.
+
+        It avoids `.item()` / dynamic-shape allocations based on runtime seqlen.
+        Output shape is always [index_topk] with invalid positions filled by -1.
+        """
+        device = query.device
+        max_seq_len = keys_full.shape[0]
+        token_idx = torch.arange(max_seq_len, device=device, dtype=torch.int32)
+        seq_len_i32 = seq_len.to(device=device, dtype=torch.int32)
+        valid_mask = token_idx < seq_len_i32
+
+        weighted_query = (query.float() * head_weights.float().unsqueeze(-1)).sum(dim=0)
+
+        chunk_size = self.cs_chunk_size
+        num_chunks = (max_seq_len + chunk_size - 1) // chunk_size
+        padded_len = num_chunks * chunk_size
+        pad_tokens = padded_len - max_seq_len
+
+        if pad_tokens > 0:
+            key_pad = torch.zeros(
+                (pad_tokens, keys_full.shape[1]),
+                dtype=keys_full.dtype,
+                device=keys_full.device,
+            )
+            keys_padded = torch.cat([keys_full, key_pad], dim=0)
+            mask_pad = torch.zeros((pad_tokens,), dtype=torch.bool, device=device)
+            valid_mask_padded = torch.cat([valid_mask, mask_pad], dim=0)
+        else:
+            keys_padded = keys_full
+            valid_mask_padded = valid_mask
+
+        chunk_keys = keys_padded.view(num_chunks, chunk_size, -1)
+        chunk_mask = valid_mask_padded.view(num_chunks, chunk_size)
+        chunk_mask_f = chunk_mask.to(dtype=chunk_keys.dtype).unsqueeze(-1)
+        chunk_sum = (chunk_keys * chunk_mask_f).sum(dim=1)
+        chunk_count = chunk_mask.sum(dim=1)
+        chunk_count_safe = chunk_count.clamp_min(1).to(dtype=chunk_sum.dtype).unsqueeze(-1)
+        chunk_mean = chunk_sum / chunk_count_safe
+        chunk_scores = chunk_mean @ weighted_query
+        neg_inf = torch.full_like(chunk_scores, float("-inf"))
+        chunk_scores = torch.where(chunk_count > 0, chunk_scores, neg_inf)
+
+        num_groups = min(self.cs_num_groups, num_chunks)
+        group_size = (num_chunks + num_groups - 1) // num_groups
+        pad_chunks = num_groups * group_size - num_chunks
+        if pad_chunks > 0:
+            chunk_scores = torch.cat([chunk_scores, chunk_scores.new_full((pad_chunks,), float("-inf"))], dim=0)
+        group_scores = chunk_scores.view(num_groups, group_size).amax(dim=1)
+
+        top_groups = group_scores.topk(min(self.cs_group_topk, num_groups), dim=-1).indices
+        group_ids = torch.div(
+            torch.arange(num_chunks, device=device, dtype=torch.int64),
+            group_size,
+            rounding_mode="floor",
+        )
+        selected_chunk_mask = (group_ids.unsqueeze(1) == top_groups.unsqueeze(0)).any(dim=1)
+
+        candidate_chunk_scores = torch.where(
+            selected_chunk_mask,
+            chunk_scores[:num_chunks],
+            chunk_scores.new_full((num_chunks,), float("-inf")),
+        )
+        chunk_budget = min(
+            num_chunks,
+            max(
+                (self.index_topk + chunk_size - 1) // chunk_size,
+                self.cs_group_topk * self.cs_chunk_topk_mult,
+            ),
+        )
+        selected_chunk_vals, selected_chunks = candidate_chunk_scores.topk(
+            chunk_budget, dim=-1
+        )
+        selected_chunk_valid = (
+            selected_chunk_mask.index_select(0, selected_chunks)
+            & torch.isfinite(selected_chunk_vals)
+        )
+
+        token_offsets = torch.arange(chunk_size, device=device, dtype=torch.int64)
+        candidate_tokens = (
+            selected_chunks.unsqueeze(1) * chunk_size + token_offsets.unsqueeze(0)
+        )
+        candidate_valid = selected_chunk_valid.unsqueeze(1)
+        candidate_valid = candidate_valid & (candidate_tokens < max_seq_len)
+
+        candidate_tokens_clamped = candidate_tokens.clamp_max(max_seq_len - 1)
+        token_valid_flat = valid_mask.index_select(
+            0, candidate_tokens_clamped.reshape(-1).to(torch.int32)
+        ).view_as(candidate_tokens_clamped)
+        candidate_valid = candidate_valid & token_valid_flat
+
+        candidate_keys = keys_full.index_select(
+            0, candidate_tokens_clamped.reshape(-1)
+        ).view(chunk_budget, chunk_size, -1)
+        candidate_scores = torch.einsum(
+            "bcd,d->bc", candidate_keys, weighted_query
+        ).to(torch.float32)
+        candidate_scores = torch.where(
+            candidate_valid,
+            candidate_scores,
+            candidate_scores.new_full(candidate_scores.shape, float("-inf")),
+        )
+
+        flat_scores = candidate_scores.reshape(-1)
+        flat_tokens = candidate_tokens_clamped.reshape(-1).to(torch.int32)
+        topk_scores, topk_pos = flat_scores.topk(self.index_topk, dim=-1)
+        topk_tokens = flat_tokens.index_select(0, topk_pos)
+        topk_tokens = torch.where(
+            torch.isfinite(topk_scores),
+            topk_tokens,
+            topk_tokens.new_full(topk_tokens.shape, -1),
+        )
+        return topk_tokens
 
     def _get_topk_csattention_npu_decode(
         self,
@@ -770,7 +903,11 @@ class Indexer(MultiPlatformOp):
             seq_lens.shape[0],
             block_table.shape[0],
         )
-        if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+        if (
+            self.cs_debug
+            and self.cs_debug_log_count < self.cs_debug_max_logs
+            and not get_is_capture_mode()
+        ):
             self.cs_debug_log_count += 1
             seq_min = int(seq_lens[:q_rows].min().item()) if q_rows > 0 else 0
             seq_max = int(seq_lens[:q_rows].max().item()) if q_rows > 0 else 0
@@ -796,28 +933,28 @@ class Indexer(MultiPlatformOp):
             return topk_result
 
         for i in range(q_rows):
-            seq_len = int(seq_lens[i].item())
-            if seq_len <= 0:
-                continue
-
-            keys = self._gather_npu_index_keys(
+            seq_len = seq_lens[i]
+            keys = self._gather_npu_index_keys_full(
                 past_key_states=past_key_states,
                 block_table_row=block_table[i],
-                seq_len=seq_len,
                 page_size=page_size,
             )
-            local_topk = self._csattention_local_topk(
+            local_topk = self._csattention_local_topk_npu_graphsafe(
                 query=query[i],
                 head_weights=weights[i],
-                keys=keys,
+                keys_full=keys,
                 seq_len=seq_len,
             )
-            if local_topk.numel() == 0:
-                continue
+            topk_result[i, :] = local_topk
 
-            k = min(self.index_topk, local_topk.numel())
-            topk_result[i, :k] = local_topk[:k]
-
+        # Align with torch_npu.npu_lightning_indexer() output format used by
+        # Ascend sparse attention: [token, group, topk]. We use a single group.
+        topk_result = topk_result.unsqueeze(1).contiguous()
+        if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+            _logger.info(
+                "NSA CSAttention NPU sparse_indices shape adjusted to %s",
+                tuple(topk_result.shape),
+            )
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -1823,22 +1960,31 @@ class Indexer(MultiPlatformOp):
             and not is_prefill
             and not isinstance(actual_seq_lengths_kv, tuple)
         ):
-            if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
-                _logger.info(
-                    "NSA CSAttention path selected in forward_npu: layer=%s "
-                    "forward_mode=decode_or_idle token_count=%s",
-                    layer_id,
-                    q.shape[0],
+            if get_is_capture_mode() and not self.cs_npu_enable_capture:
+                if not self.cs_graph_capture_fallback_logged:
+                    _logger.warning(
+                        "NSA CSAttention is not graph-capture-safe on NPU yet. "
+                        "Falling back to npu_lightning_indexer during graph capture. "
+                        "Set SGLANG_NSA_CSATTENTION_NPU_ENABLE_CAPTURE=1 to try phase-2 path."
+                    )
+                    self.cs_graph_capture_fallback_logged = True
+            else:
+                if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+                    _logger.info(
+                        "NSA CSAttention path selected in forward_npu: layer=%s "
+                        "forward_mode=decode_or_idle token_count=%s",
+                        layer_id,
+                        q.shape[0],
+                    )
+                return self._get_topk_csattention_npu_decode(
+                    layer_id=layer_id,
+                    query=q.view(-1, self.n_heads, self.head_dim),
+                    weights=weights,
+                    seq_lens=actual_seq_lengths_kv.to(device=q.device, dtype=torch.int32),
+                    block_table=block_table,
+                    past_key_states=past_key_states,
+                    page_size=forward_batch.token_to_kv_pool.page_size,
                 )
-            return self._get_topk_csattention_npu_decode(
-                layer_id=layer_id,
-                query=q.view(-1, self.n_heads, self.head_dim),
-                weights=weights,
-                seq_lens=actual_seq_lengths_kv.to(device=q.device, dtype=torch.int32),
-                block_table=block_table,
-                past_key_states=past_key_states,
-                page_size=forward_batch.token_to_kv_pool.page_size,
-            )
         if (
             is_prefill
             and self.nsa_enable_prefill_cp
