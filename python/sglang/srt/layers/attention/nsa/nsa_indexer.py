@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -20,6 +21,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -34,6 +36,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
+_use_sparseattention = get_bool_env_var("SGLANG_NSA_USE_SPARSEATTENTION", "false")
+_logger = logging.getLogger(__name__)
 if _is_cuda:
     try:
         import deep_gemm
@@ -238,6 +242,37 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        # HISA-style sparse indexer path for standalone SparseAttention validation.
+        self.use_sparseattention = (_is_cuda or _is_npu) and _use_sparseattention
+        self.sa_block_size = max(1, get_int_env_var("SGLANG_NSA_SA_BLOCK_SIZE", 128))
+        self.sa_topm_blocks = max(1, get_int_env_var("SGLANG_NSA_SA_TOPM_BLOCKS", 64))
+        self.sa_recent_tokens = max(
+            0, get_int_env_var("SGLANG_NSA_SA_RECENT_TOKENS", 256)
+        )
+        self.sa_min_seq_len = max(
+            0, get_int_env_var("SGLANG_NSA_SA_MIN_SEQ_LEN", 4096)
+        )
+        self.sa_boundary_blocks = max(
+            0, get_int_env_var("SGLANG_NSA_SA_BOUNDARY_BLOCKS", 2)
+        )
+        self.sa_debug = get_bool_env_var("SGLANG_NSA_SA_DEBUG", "false")
+        # NPU fallback prioritizes correctness and chain bring-up over peak perf.
+        self.sa_npu_fallback = _is_npu and get_bool_env_var(
+            "SGLANG_NSA_NPU_SA_FALLBACK", "true"
+        )
+        if self.sa_debug:
+            _logger.info(
+                "NSA SparseAttention config: enabled=%s layer=%s block_size=%s topm=%s "
+                "recent_tokens=%s min_seq_len=%s boundary_blocks=%s npu_fallback=%s",
+                self.use_sparseattention,
+                self.layer_id,
+                self.sa_block_size,
+                self.sa_topm_blocks,
+                self.sa_recent_tokens,
+                self.sa_min_seq_len,
+                self.sa_boundary_blocks,
+                self.sa_npu_fallback,
+            )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -413,6 +448,177 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
+    def _sparseattention_scores(
+        self,
+        query: torch.Tensor,
+        head_weights: torch.Tensor,
+        keys: torch.Tensor,
+    ) -> torch.Tensor:
+        # query: [H, D], head_weights: [H], keys: [T, D]
+        q = query.to(torch.float32)
+        w = head_weights.to(torch.float32)
+        k = keys.to(torch.float32)
+        logits = torch.matmul(k, q.transpose(0, 1))
+        logits = torch.relu(logits)
+        return torch.matmul(logits, w)
+
+    def _sparseattention_local_topk(
+        self,
+        query: torch.Tensor,
+        head_weights: torch.Tensor,
+        keys: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        if seq_len <= 0:
+            return torch.empty(0, dtype=torch.int32, device=query.device)
+
+        keys = keys[:seq_len]
+        topk = min(self.index_topk, seq_len)
+        if topk <= 0:
+            return torch.empty(0, dtype=torch.int32, device=query.device)
+
+        if seq_len <= self.sa_min_seq_len:
+            full_scores = self._sparseattention_scores(query, head_weights, keys)
+            return full_scores.topk(topk, dim=-1).indices.to(torch.int32)
+
+        block_size = self.sa_block_size
+        num_blocks = (seq_len + block_size - 1) // block_size
+        pad_tokens = num_blocks * block_size - seq_len
+        if pad_tokens > 0:
+            keys_padded = torch.cat(
+                [
+                    keys,
+                    torch.zeros(
+                        (pad_tokens, keys.shape[-1]),
+                        dtype=keys.dtype,
+                        device=keys.device,
+                    ),
+                ],
+                dim=0,
+            )
+        else:
+            keys_padded = keys
+
+        block_view = keys_padded.view(num_blocks, block_size, -1)
+        if pad_tokens > 0:
+            block_sum = block_view.sum(dim=1)
+            block_count = torch.full(
+                (num_blocks,), block_size, dtype=torch.float32, device=keys.device
+            )
+            block_count[-1] = block_size - pad_tokens
+            block_reprs = block_sum / block_count.unsqueeze(-1)
+        else:
+            block_reprs = block_view.mean(dim=1)
+
+        block_scores = self._sparseattention_scores(query, head_weights, block_reprs)
+        m = min(self.sa_topm_blocks, num_blocks)
+        top_blocks = block_scores.topk(m, dim=-1).indices.to(torch.int64)
+
+        block_mask = torch.zeros(num_blocks, dtype=torch.bool, device=keys.device)
+        block_mask[top_blocks] = True
+        if num_blocks > 0:
+            block_mask[0] = True
+            for i in range(self.sa_boundary_blocks):
+                idx = num_blocks - 1 - i
+                if idx < 0:
+                    break
+                block_mask[idx] = True
+        candidate_blocks = torch.nonzero(block_mask, as_tuple=False).squeeze(-1)
+
+        block_offsets = torch.arange(block_size, device=keys.device, dtype=torch.int64)
+        candidate_tokens = (
+            candidate_blocks.unsqueeze(1) * block_size + block_offsets.unsqueeze(0)
+        ).reshape(-1)
+        candidate_tokens = candidate_tokens[candidate_tokens < seq_len]
+
+        token_mask = torch.zeros(seq_len, dtype=torch.bool, device=keys.device)
+        if candidate_tokens.numel() > 0:
+            token_mask[candidate_tokens] = True
+
+        if self.sa_recent_tokens > 0:
+            recent_start = max(0, seq_len - self.sa_recent_tokens)
+            token_mask[recent_start:seq_len] = True
+
+        candidate_tokens = torch.nonzero(token_mask, as_tuple=False).squeeze(-1)
+        if candidate_tokens.numel() == 0:
+            return torch.empty(0, dtype=torch.int32, device=keys.device)
+
+        candidate_keys = keys.index_select(0, candidate_tokens)
+        candidate_scores = self._sparseattention_scores(
+            query, head_weights, candidate_keys
+        )
+        k = min(self.index_topk, candidate_tokens.numel())
+        top_candidates = candidate_scores.topk(k, dim=-1).indices
+        return candidate_tokens[top_candidates].to(torch.int32)
+
+    def _get_topk_sparseattention_decode(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        if TYPE_CHECKING:
+            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        assert page_size == 64, "SparseAttention decode path currently assumes page size 64."
+
+        block_tables_64 = metadata.get_page_table_64()
+        block_tables_1 = metadata.get_page_table_1()
+        seq_lens = metadata.get_seqlens_int32()
+        q_rows = min(
+            query.shape[0],
+            weights.shape[0],
+            block_tables_64.shape[0],
+            block_tables_1.shape[0],
+            seq_lens.shape[0],
+        )
+
+        topk_result = torch.full(
+            (query.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        if q_rows == 0:
+            return topk_result
+
+        fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+        for i in range(q_rows):
+            seq_len = int(seq_lens[i].item())
+            if seq_len <= 0:
+                continue
+
+            page_indices = block_tables_64[i]
+            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
+                layer_id, seq_len, page_indices
+            )
+            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+                layer_id, seq_len, page_indices
+            )
+            keys = k_fp8.view(fp8_dtype).to(torch.float32)
+            scales = k_scale.view(torch.float32).squeeze(-1).unsqueeze(-1)
+            keys = keys * scales
+
+            local_topk = self._sparseattention_local_topk(
+                query=query[i],
+                head_weights=weights[i],
+                keys=keys,
+                seq_len=seq_len,
+            )
+            if local_topk.numel() == 0:
+                continue
+
+            k = min(self.index_topk, local_topk.numel())
+            if envs.SGLANG_NSA_FUSE_TOPK.get():
+                mapped = block_tables_1[i].index_select(0, local_topk[:k].to(torch.int64))
+                topk_result[i, :k] = mapped.to(torch.int32)
+            else:
+                topk_result[i, :k] = local_topk[:k]
+        return topk_result
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -521,6 +727,105 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
+
+    @staticmethod
+    def _build_cu_ranges(cu_lens: torch.Tensor) -> List[Tuple[int, int]]:
+        ranges: List[Tuple[int, int]] = []
+        start = 0
+        for end in cu_lens.tolist():
+            end_i = int(end)
+            ranges.append((start, end_i))
+            start = end_i
+        return ranges
+
+    def _extract_npu_keys_from_block_table(
+        self,
+        past_key_states: torch.Tensor,
+        block_table_row: torch.Tensor,
+        seq_len: int,
+        page_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if seq_len <= 0:
+            empty_keys = past_key_states.new_empty((0, past_key_states.shape[-1]))
+            empty_pages = block_table_row.new_empty((0,), dtype=torch.int64)
+            return empty_keys, empty_pages
+
+        num_pages = (seq_len + page_size - 1) // page_size
+        page_ids = block_table_row[:num_pages].to(torch.int64)
+        valid_mask = page_ids >= 0
+        page_ids = page_ids[valid_mask]
+        if page_ids.numel() == 0:
+            empty_keys = past_key_states.new_empty((0, past_key_states.shape[-1]))
+            return empty_keys, page_ids
+
+        key_pages = past_key_states.index_select(0, page_ids)
+        keys = key_pages.reshape(-1, key_pages.shape[-1])[:seq_len]
+        return keys, page_ids
+
+    def _get_topk_sparseattention_npu(
+        self,
+        query: torch.Tensor,
+        weights: Optional[torch.Tensor],
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        block_table: torch.Tensor,
+        past_key_states: torch.Tensor,
+        page_size: int,
+    ) -> torch.Tensor:
+        topk_result = torch.full(
+            (query.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        if query.shape[0] == 0:
+            return topk_result
+
+        q_ranges = self._build_cu_ranges(actual_seq_lengths_q.to(torch.int64).cpu())
+        for batch_idx, (q_start, q_end) in enumerate(q_ranges):
+            if q_end <= q_start:
+                continue
+            seq_len = int(actual_seq_lengths_kv[batch_idx].item())
+            if seq_len <= 0:
+                continue
+
+            keys, page_ids = self._extract_npu_keys_from_block_table(
+                past_key_states=past_key_states,
+                block_table_row=block_table[batch_idx],
+                seq_len=seq_len,
+                page_size=page_size,
+            )
+            if keys.shape[0] == 0:
+                continue
+
+            for q_row in range(q_start, q_end):
+                row_weights = (
+                    weights[q_row]
+                    if weights is not None
+                    else torch.ones(
+                        self.n_heads, dtype=query.dtype, device=query.device
+                    )
+                )
+                local_topk = self._sparseattention_local_topk(
+                    query=query[q_row],
+                    head_weights=row_weights,
+                    keys=keys,
+                    seq_len=seq_len,
+                )
+                if local_topk.numel() == 0:
+                    continue
+
+                k = min(self.index_topk, local_topk.numel())
+                if envs.SGLANG_NSA_FUSE_TOPK.get():
+                    page_pos = (local_topk[:k].to(torch.int64) // page_size).clamp(
+                        max=max(page_ids.numel() - 1, 0)
+                    )
+                    page_off = local_topk[:k].to(torch.int64) % page_size
+                    mapped = page_ids.index_select(0, page_pos) * page_size + page_off
+                    topk_result[q_row, :k] = mapped.to(torch.int32)
+                else:
+                    topk_result[q_row, :k] = local_topk[:k].to(torch.int32)
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -1203,6 +1508,22 @@ class Indexer(MultiPlatformOp):
                 )
 
             if (
+                self.use_sparseattention
+                and _is_cuda
+                and forward_batch.forward_mode.is_decode_or_idle()
+            ):
+                weights_for_sparse = (
+                    weights.squeeze(-1) if weights.ndim == 3 else weights
+                )
+                return self._get_topk_sparseattention_decode(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    query=query,
+                    weights=weights_for_sparse,
+                    metadata=metadata,
+                )
+
+            if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
@@ -1494,6 +1815,7 @@ class Indexer(MultiPlatformOp):
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
+        query_for_index = q.view(-1, self.n_heads, self.head_dim)
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill
@@ -1502,7 +1824,7 @@ class Indexer(MultiPlatformOp):
         ):
             block_table = block_table[: actual_seq_lengths_q[0].numel()]
             topk_indices = self.do_npu_cp_balance_indexer(
-                q.view(-1, self.n_heads, self.head_dim),
+                query_for_index,
                 past_key_states,
                 weights,
                 actual_seq_lengths_q,
@@ -1516,22 +1838,52 @@ class Indexer(MultiPlatformOp):
                 if is_prefill
                 else block_table
             )
+            actual_seq_lengths_q_t = actual_seq_lengths_q.to(torch.int32)
+            actual_seq_lengths_kv_t = actual_seq_lengths_kv.to(k.device).to(torch.int32)
+            page_size = forward_batch.token_to_kv_pool.page_size
 
-            topk_indices = torch_npu.npu_lightning_indexer(
-                query=q.view(-1, self.n_heads, self.head_dim),
-                key=past_key_states,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                    torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )
-            return topk_indices[0]
+            if self.use_sparseattention and self.sa_npu_fallback:
+                return self._get_topk_sparseattention_npu(
+                    query=query_for_index,
+                    weights=weights,
+                    actual_seq_lengths_q=actual_seq_lengths_q_t,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv_t,
+                    block_table=block_table,
+                    past_key_states=past_key_states,
+                    page_size=page_size,
+                )
+
+            try:
+                topk_indices = torch_npu.npu_lightning_indexer(
+                    query=query_for_index,
+                    key=past_key_states,
+                    weights=weights,
+                    actual_seq_lengths_query=actual_seq_lengths_q_t,
+                    actual_seq_lengths_key=actual_seq_lengths_kv_t,
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                )
+                return topk_indices[0]
+            except Exception as exc:
+                if not (self.sa_npu_fallback and self.use_sparseattention):
+                    raise
+                _logger.warning(
+                    "npu_lightning_indexer failed at layer %s, falling back to SparseAttention path: %s",
+                    layer_id,
+                    exc,
+                )
+                return self._get_topk_sparseattention_npu(
+                    query=query_for_index,
+                    weights=weights,
+                    actual_seq_lengths_q=actual_seq_lengths_q_t,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv_t,
+                    block_table=block_table,
+                    past_key_states=past_key_states,
+                    page_size=page_size,
+                )
 
     def do_npu_cp_balance_indexer(
         self,
