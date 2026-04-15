@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -36,6 +37,8 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
 _use_csattention = get_bool_env_var("SGLANG_NSA_USE_CSATTENTION", "false")
+_csattention_debug = get_bool_env_var("SGLANG_NSA_CSATTENTION_DEBUG", "false")
+_logger = logging.getLogger(__name__)
 if _is_cuda:
     try:
         import deep_gemm
@@ -255,6 +258,27 @@ class Indexer(MultiPlatformOp):
         self.cs_min_seq_len = max(
             0, get_int_env_var("SGLANG_NSA_CS_MIN_SEQ_LEN", 4096)
         )
+        self.cs_debug = _csattention_debug
+        self.cs_debug_max_logs = max(
+            1, get_int_env_var("SGLANG_NSA_CSATTENTION_DEBUG_MAX_LOGS", 20)
+        )
+        self.cs_debug_log_count = 0
+        if self.cs_debug:
+            _logger.info(
+                "NSA CSAttention debug enabled: use_csattention=%s layer_id=%s topk=%s "
+                "chunk_size=%s num_groups=%s group_topk=%s chunk_topk_mult=%s "
+                "recent_tokens=%s min_seq_len=%s max_logs=%s",
+                self.use_csattention,
+                self.layer_id,
+                self.index_topk,
+                self.cs_chunk_size,
+                self.cs_num_groups,
+                self.cs_group_topk,
+                self.cs_chunk_topk_mult,
+                self.cs_recent_tokens,
+                self.cs_min_seq_len,
+                self.cs_debug_max_logs,
+            )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -648,7 +672,29 @@ class Indexer(MultiPlatformOp):
         block_tables_64 = metadata.get_page_table_64()
         block_tables_1 = metadata.get_page_table_1()
         seq_lens = metadata.get_seqlens_int32()
-        q_rows = min(query.shape[0], weights.shape[0], block_tables_64.shape[0])
+        q_rows = min(
+            query.shape[0],
+            weights.shape[0],
+            block_tables_64.shape[0],
+            block_tables_1.shape[0],
+            seq_lens.shape[0],
+        )
+        if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+            self.cs_debug_log_count += 1
+            seq_min = int(seq_lens[:q_rows].min().item()) if q_rows > 0 else 0
+            seq_max = int(seq_lens[:q_rows].max().item()) if q_rows > 0 else 0
+            _logger.info(
+                "NSA CSAttention decode hit #%s layer=%s q_rows=%s query_rows=%s "
+                "weights_rows=%s seq_len[min,max]=[%s,%s] fuse_topk=%s",
+                self.cs_debug_log_count,
+                layer_id,
+                q_rows,
+                query.shape[0],
+                weights.shape[0],
+                seq_min,
+                seq_max,
+                envs.SGLANG_NSA_FUSE_TOPK.get(),
+            )
 
         topk_result = torch.full(
             (query.shape[0], self.index_topk),
@@ -1380,6 +1426,13 @@ class Indexer(MultiPlatformOp):
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and _is_cuda
             ):
+                if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+                    _logger.info(
+                        "NSA CSAttention path selected in forward_cuda: layer=%s "
+                        "forward_mode=decode_or_idle token_count=%s",
+                        layer_id,
+                        x_meta.shape[0],
+                    )
                 if weights.ndim == 3:
                     weights_for_cs = weights.squeeze(-1)
                 else:
