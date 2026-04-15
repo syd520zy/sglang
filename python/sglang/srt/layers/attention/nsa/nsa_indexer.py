@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+_device_arange_cache: Dict[Tuple[str, int, int, torch.dtype], torch.Tensor] = {}
 
 
 class BaseIndexerMetadata(ABC):
@@ -757,15 +758,40 @@ class Indexer(MultiPlatformOp):
         self,
         past_key_states: torch.Tensor,
         block_table_row: torch.Tensor,
+        seq_len: torch.Tensor,
         page_size: int,
     ) -> torch.Tensor:
         max_seq_len = block_table_row.shape[0] * page_size
-        token_idx = torch.arange(
+        token_idx = self._get_cached_arange(
             max_seq_len, device=block_table_row.device, dtype=torch.long
         )
+        seq_len_i64 = seq_len.to(device=block_table_row.device, dtype=torch.long)
+        valid_token_mask = token_idx < seq_len_i64
+
         page_ids = block_table_row[token_idx // page_size].to(torch.long)
         page_offsets = (token_idx % page_size).to(torch.long)
+
+        # Graph-safe guard: avoid touching padded/invalid block table entries.
+        zero_like_ids = torch.zeros_like(page_ids)
+        zero_like_offsets = torch.zeros_like(page_offsets)
+        page_ids = torch.where(valid_token_mask, page_ids, zero_like_ids)
+        page_offsets = torch.where(valid_token_mask, page_offsets, zero_like_offsets)
+        page_ids = torch.where(page_ids >= 0, page_ids, zero_like_ids)
+
         return past_key_states[page_ids, page_offsets, 0, :].to(torch.float32)
+
+    @staticmethod
+    def _get_cached_arange(
+        length: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # Keep per-device cache to avoid host->device copy during graph capture.
+        device_index = -1 if device.index is None else int(device.index)
+        key = (device.type, device_index, length, dtype)
+        base = _device_arange_cache.get(key)
+        if base is None:
+            base = torch.arange(length, dtype=dtype, device=device)
+            _device_arange_cache[key] = base
+        return base
 
     def _csattention_local_topk_npu_graphsafe(
         self,
@@ -781,7 +807,9 @@ class Indexer(MultiPlatformOp):
         """
         device = query.device
         max_seq_len = keys_full.shape[0]
-        token_idx = torch.arange(max_seq_len, device=device, dtype=torch.int32)
+        token_idx = self._get_cached_arange(
+            max_seq_len, device=device, dtype=torch.int32
+        )
         seq_len_i32 = seq_len.to(device=device, dtype=torch.int32)
         valid_mask = token_idx < seq_len_i32
 
@@ -810,7 +838,9 @@ class Indexer(MultiPlatformOp):
         chunk_mask_f = chunk_mask.to(dtype=chunk_keys.dtype).unsqueeze(-1)
         chunk_sum = (chunk_keys * chunk_mask_f).sum(dim=1)
         chunk_count = chunk_mask.sum(dim=1)
-        chunk_count_safe = chunk_count.clamp_min(1).to(dtype=chunk_sum.dtype).unsqueeze(-1)
+        chunk_count_safe = torch.where(
+            chunk_count > 0, chunk_count, torch.ones_like(chunk_count)
+        ).to(dtype=chunk_sum.dtype).unsqueeze(-1)
         chunk_mean = chunk_sum / chunk_count_safe
         chunk_scores = chunk_mean @ weighted_query
         neg_inf = torch.full_like(chunk_scores, float("-inf"))
@@ -825,7 +855,7 @@ class Indexer(MultiPlatformOp):
 
         top_groups = group_scores.topk(min(self.cs_group_topk, num_groups), dim=-1).indices
         group_ids = torch.div(
-            torch.arange(num_chunks, device=device, dtype=torch.int64),
+            self._get_cached_arange(num_chunks, device=device, dtype=torch.int64),
             group_size,
             rounding_mode="floor",
         )
@@ -851,14 +881,21 @@ class Indexer(MultiPlatformOp):
             & torch.isfinite(selected_chunk_vals)
         )
 
-        token_offsets = torch.arange(chunk_size, device=device, dtype=torch.int64)
+        token_offsets = self._get_cached_arange(
+            chunk_size, device=device, dtype=torch.int64
+        )
         candidate_tokens = (
             selected_chunks.unsqueeze(1) * chunk_size + token_offsets.unsqueeze(0)
         )
         candidate_valid = selected_chunk_valid.unsqueeze(1)
         candidate_valid = candidate_valid & (candidate_tokens < max_seq_len)
 
-        candidate_tokens_clamped = candidate_tokens.clamp_max(max_seq_len - 1)
+        max_token_index = torch.full_like(candidate_tokens, max_seq_len - 1)
+        candidate_tokens_clamped = torch.where(
+            candidate_tokens < max_seq_len,
+            candidate_tokens,
+            max_token_index,
+        )
         token_valid_flat = valid_mask.index_select(
             0, candidate_tokens_clamped.reshape(-1).to(torch.int32)
         ).view_as(candidate_tokens_clamped)
@@ -937,6 +974,7 @@ class Indexer(MultiPlatformOp):
             keys = self._gather_npu_index_keys_full(
                 past_key_states=past_key_states,
                 block_table_row=block_table[i],
+                seq_len=seq_len,
                 page_size=page_size,
             )
             local_topk = self._csattention_local_topk_npu_graphsafe(
