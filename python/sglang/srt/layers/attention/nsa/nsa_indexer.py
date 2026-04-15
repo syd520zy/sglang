@@ -243,9 +243,9 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
-        # Experimental CSAttention-like retrieval (GPU decode-only).
+        # Experimental CSAttention-like retrieval (GPU/NPU decode-only).
         # Toggle with SGLANG_NSA_USE_CSATTENTION=1.
-        self.use_csattention = _is_cuda and _use_csattention
+        self.use_csattention = (_is_cuda or _is_npu) and _use_csattention
         self.cs_chunk_size = max(1, get_int_env_var("SGLANG_NSA_CS_CHUNK_SIZE", 64))
         self.cs_num_groups = max(1, get_int_env_var("SGLANG_NSA_CS_NUM_GROUPS", 32))
         self.cs_group_topk = max(1, get_int_env_var("SGLANG_NSA_CS_GROUP_TOPK", 8))
@@ -739,6 +739,84 @@ class Indexer(MultiPlatformOp):
                 topk_result[i, :k] = mapped.to(torch.int32)
             else:
                 topk_result[i, :k] = local_topk[:k]
+
+        return topk_result
+
+    def _gather_npu_index_keys(
+        self,
+        past_key_states: torch.Tensor,
+        block_table_row: torch.Tensor,
+        seq_len: int,
+        page_size: int,
+    ) -> torch.Tensor:
+        token_idx = torch.arange(seq_len, device=block_table_row.device, dtype=torch.long)
+        page_ids = block_table_row[token_idx // page_size].to(torch.long)
+        page_offsets = (token_idx % page_size).to(torch.long)
+        return past_key_states[page_ids, page_offsets, 0, :].to(torch.float32)
+
+    def _get_topk_csattention_npu_decode(
+        self,
+        layer_id: int,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        past_key_states: torch.Tensor,
+        page_size: int,
+    ) -> torch.Tensor:
+        q_rows = min(
+            query.shape[0],
+            weights.shape[0],
+            seq_lens.shape[0],
+            block_table.shape[0],
+        )
+        if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+            self.cs_debug_log_count += 1
+            seq_min = int(seq_lens[:q_rows].min().item()) if q_rows > 0 else 0
+            seq_max = int(seq_lens[:q_rows].max().item()) if q_rows > 0 else 0
+            _logger.info(
+                "NSA CSAttention NPU decode hit #%s layer=%s q_rows=%s query_rows=%s "
+                "weights_rows=%s seq_len[min,max]=[%s,%s]",
+                self.cs_debug_log_count,
+                layer_id,
+                q_rows,
+                query.shape[0],
+                weights.shape[0],
+                seq_min,
+                seq_max,
+            )
+
+        topk_result = torch.full(
+            (query.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        if q_rows == 0:
+            return topk_result
+
+        for i in range(q_rows):
+            seq_len = int(seq_lens[i].item())
+            if seq_len <= 0:
+                continue
+
+            keys = self._gather_npu_index_keys(
+                past_key_states=past_key_states,
+                block_table_row=block_table[i],
+                seq_len=seq_len,
+                page_size=page_size,
+            )
+            local_topk = self._csattention_local_topk(
+                query=query[i],
+                head_weights=weights[i],
+                keys=keys,
+                seq_len=seq_len,
+            )
+            if local_topk.numel() == 0:
+                continue
+
+            k = min(self.index_topk, local_topk.numel())
+            topk_result[i, :k] = local_topk[:k]
 
         return topk_result
 
@@ -1738,6 +1816,29 @@ class Indexer(MultiPlatformOp):
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
+        if (
+            self.use_csattention
+            and _is_npu
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not is_prefill
+            and not isinstance(actual_seq_lengths_kv, tuple)
+        ):
+            if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+                _logger.info(
+                    "NSA CSAttention path selected in forward_npu: layer=%s "
+                    "forward_mode=decode_or_idle token_count=%s",
+                    layer_id,
+                    q.shape[0],
+                )
+            return self._get_topk_csattention_npu_decode(
+                layer_id=layer_id,
+                query=q.view(-1, self.n_heads, self.head_dim),
+                weights=weights,
+                seq_lens=actual_seq_lengths_kv.to(device=q.device, dtype=torch.int32),
+                block_table=block_table,
+                past_key_states=past_key_states,
+                page_size=forward_batch.token_to_kv_pool.page_size,
+            )
         if (
             is_prefill
             and self.nsa_enable_prefill_cp
