@@ -256,6 +256,9 @@ class Indexer(MultiPlatformOp):
         self.cs_recent_tokens = max(
             0, get_int_env_var("SGLANG_NSA_CS_RECENT_TOKENS", 256)
         )
+        self.cs_long_context_threshold = max(
+            0, get_int_env_var("SGLANG_NSA_CS_LONG_CONTEXT_THRESHOLD", 16384)
+        )
         self.cs_min_seq_len = max(
             0, get_int_env_var("SGLANG_NSA_CS_MIN_SEQ_LEN", 4096)
         )
@@ -274,7 +277,7 @@ class Indexer(MultiPlatformOp):
             _logger.info(
                 "NSA CSAttention debug enabled: use_csattention=%s layer_id=%s topk=%s "
                 "chunk_size=%s num_groups=%s group_topk=%s chunk_topk_mult=%s "
-                "recent_tokens=%s min_seq_len=%s max_logs=%s",
+                "recent_tokens=%s long_ctx_threshold=%s min_seq_len=%s max_logs=%s",
                 self.use_csattention,
                 self.layer_id,
                 self.index_topk,
@@ -283,6 +286,7 @@ class Indexer(MultiPlatformOp):
                 self.cs_group_topk,
                 self.cs_chunk_topk_mult,
                 self.cs_recent_tokens,
+                self.cs_long_context_threshold,
                 self.cs_min_seq_len,
                 self.cs_debug_max_logs,
             )
@@ -1998,7 +2002,22 @@ class Indexer(MultiPlatformOp):
             and not is_prefill
             and not isinstance(actual_seq_lengths_kv, tuple)
         ):
-            if get_is_capture_mode() and not self.cs_npu_enable_capture:
+            use_cs_by_len = False
+            max_seq_len = 0
+            if actual_seq_lengths_kv.numel() > 0:
+                max_seq_len = int(actual_seq_lengths_kv.max().item())
+                use_cs_by_len = max_seq_len >= self.cs_long_context_threshold
+
+            if not use_cs_by_len:
+                if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+                    self.cs_debug_log_count += 1
+                    _logger.info(
+                        "Skip NSA CSAttention on NPU due to seq threshold: "
+                        "max_seq_len=%s threshold=%s",
+                        max_seq_len,
+                        self.cs_long_context_threshold,
+                    )
+            elif get_is_capture_mode() and not self.cs_npu_enable_capture:
                 if not self.cs_graph_capture_fallback_logged:
                     _logger.warning(
                         "NSA CSAttention is not graph-capture-safe on NPU yet. "

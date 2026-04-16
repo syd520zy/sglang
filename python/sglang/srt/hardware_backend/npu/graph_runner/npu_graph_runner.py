@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
     get_compiler_backend,
+    get_int_env_var,
     is_npu,
 )
 
@@ -81,6 +82,18 @@ class NPUGraphRunner(CudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        # 1+3 strategy for NPU:
+        # - keep graph for normal decode batches
+        # - bypass graph for long-context decode when CSAttention is enabled
+        self.nsa_csattention_enabled = get_bool_env_var("SGLANG_NSA_USE_CSATTENTION", "false")
+        self.nsa_cs_graph_outside = get_bool_env_var(
+            "SGLANG_NSA_CSATTENTION_NPU_GRAPH_OUTSIDE", "true"
+        )
+        self.nsa_cs_long_context_threshold = max(
+            0, get_int_env_var("SGLANG_NSA_CS_LONG_CONTEXT_THRESHOLD", 16384)
+        )
+        self.is_nsa_model = is_deepseek_nsa(self.model_runner.model_config.hf_config)
+        self._nsa_cs_bypass_graph_logged = False
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -212,3 +225,37 @@ class NPUGraphRunner(CudaGraphRunner):
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+
+    def can_run(self, forward_batch: ForwardBatch):
+        if not super().can_run(forward_batch):
+            return False
+
+        if (
+            not self.nsa_csattention_enabled
+            or not self.nsa_cs_graph_outside
+            or not self.is_nsa_model
+            or not forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            return True
+
+        max_seq_len = None
+        if forward_batch.seq_lens_cpu is not None:
+            max_seq_len = int(forward_batch.seq_lens_cpu.max().item())
+        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
+            max_seq_len = int(forward_batch.seq_lens.max().item())
+
+        if max_seq_len is None:
+            return True
+
+        if max_seq_len >= self.nsa_cs_long_context_threshold:
+            if not self._nsa_cs_bypass_graph_logged:
+                logger.info(
+                    "Bypass NPU graph for long-context CSAttention batch: "
+                    "max_seq_len=%s threshold=%s",
+                    max_seq_len,
+                    self.nsa_cs_long_context_threshold,
+                )
+                self._nsa_cs_bypass_graph_logged = True
+            return False
+
+        return True
