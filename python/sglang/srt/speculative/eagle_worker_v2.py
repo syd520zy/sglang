@@ -553,12 +553,20 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
-        )
+        if batch_result.accept_indices is not None:
+            bs = len(batch.seq_lens)
+            row_idx = torch.arange(bs, device=self.device, dtype=torch.long)
+            col_idx = (batch_result.accept_lens - 1).to(torch.long)
+            # Select the last accepted token for each request from the accepted chain.
+            select_index = batch_result.accept_indices[row_idx, col_idx].to(torch.long)
+        else:
+            select_index = (
+                torch.arange(len(batch.seq_lens), device=self.device)
+                * self.speculative_num_draft_tokens
+                + batch_result.accept_lens
+                - 1
+            )
+        select_index = select_index.to(torch.long)
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
@@ -868,6 +876,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
+            accept_indices=accept_index,
         )
 
     def _mamba_verify_update(
@@ -884,7 +893,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         accepted_length_with_bonus = accept_length
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             if verify_input.topk != 1:
-                raise ValueError("Spec v2 currently only supports topk = 1.")
+                raise ValueError(
+                    "Mamba state update in Spec v2 currently only supports topk = 1."
+                )
 
             accepted_indices_offset = torch.arange(
                 0,

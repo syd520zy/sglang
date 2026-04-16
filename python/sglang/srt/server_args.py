@@ -3285,8 +3285,12 @@ class ServerArgs:
                     self.speculative_eagle_topk is not None
                     and self.speculative_eagle_topk > 1
                 ):
-                    raise ValueError(
-                        "Spec v2 currently only supports topk = 1 for speculative decoding."
+                    if self.speculative_algorithm == "STANDALONE":
+                        raise ValueError(
+                            "Spec v2 currently only supports topk = 1 for standalone speculative decoding."
+                        )
+                    logger.warning(
+                        "Spec v2 topk > 1 is enabled for EAGLE/EAGLE3 with chain-output compatibility mode."
                     )
             else:
                 self.disable_overlap_schedule = True

@@ -355,14 +355,26 @@ class SchedulerOutputProcessorMixin:
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
+        accept_indices = None
+        if result.accept_indices is not None:
+            assert result.accept_indices.is_cpu
+            accept_indices = result.accept_indices.tolist()
         stride = self.draft_worker.speculative_num_draft_tokens
 
         for i, req in enumerate(batch.reqs):
             # -1 because prepare_for_decode pre-claimed the bonus slot.
             req.kv_committed_len += accept_lens[i] - 1
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+            if accept_indices is None:
+                predict_tokens.append(
+                    next_token_ids[i * stride : i * stride + accept_lens[i]]
+                )
+            else:
+                idx_row = accept_indices[i][: accept_lens[i]]
+                if any(idx < 0 for idx in idx_row):
+                    raise ValueError(
+                        f"Invalid accept indices in spec-v2 output: req={i}, accept_lens={accept_lens[i]}, indices={idx_row}"
+                    )
+                predict_tokens.append([next_token_ids[idx] for idx in idx_row])
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
