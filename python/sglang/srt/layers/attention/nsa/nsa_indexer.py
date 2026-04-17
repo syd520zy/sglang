@@ -273,6 +273,21 @@ class Indexer(MultiPlatformOp):
         self.cs_npu_enable_capture = get_bool_env_var(
             "SGLANG_NSA_CSATTENTION_NPU_ENABLE_CAPTURE", "false"
         )
+        # Layer-level local graph policy for NPU graph capture:
+        # only selected layers use CSAttention inside captured graph, others keep
+        # npu_lightning_indexer path to control TPOT overhead.
+        self.cs_npu_capture_layer_stride = max(
+            1, get_int_env_var("SGLANG_NSA_CSATTENTION_NPU_CAPTURE_LAYER_STRIDE", 4)
+        )
+        self.cs_npu_capture_layer_offset = max(
+            0, get_int_env_var("SGLANG_NSA_CSATTENTION_NPU_CAPTURE_LAYER_OFFSET", 0)
+        )
+        self.cs_npu_capture_max_layers = max(
+            0, get_int_env_var("SGLANG_NSA_CSATTENTION_NPU_CAPTURE_MAX_LAYERS", 0)
+        )
+        self.cs_npu_capture_ignore_seq_threshold = get_bool_env_var(
+            "SGLANG_NSA_CSATTENTION_NPU_CAPTURE_IGNORE_SEQ_THRESHOLD", "true"
+        )
         if self.cs_debug:
             _logger.info(
                 "NSA CSAttention debug enabled: use_csattention=%s layer_id=%s topk=%s "
@@ -292,8 +307,13 @@ class Indexer(MultiPlatformOp):
             )
             if _is_npu:
                 _logger.info(
-                    "NSA CSAttention NPU capture mode enabled=%s",
+                    "NSA CSAttention NPU capture mode enabled=%s "
+                    "stride=%s offset=%s max_layers=%s ignore_seq_threshold=%s",
                     self.cs_npu_enable_capture,
+                    self.cs_npu_capture_layer_stride,
+                    self.cs_npu_capture_layer_offset,
+                    self.cs_npu_capture_max_layers,
+                    self.cs_npu_capture_ignore_seq_threshold,
                 )
 
     @contextlib.contextmanager
@@ -796,6 +816,22 @@ class Indexer(MultiPlatformOp):
             base = torch.arange(length, dtype=dtype, device=device)
             _device_arange_cache[key] = base
         return base
+
+    def _should_use_csattention_npu_capture_layer(self, layer_id: int) -> bool:
+        if layer_id < self.cs_npu_capture_layer_offset:
+            return False
+        if (
+            (layer_id - self.cs_npu_capture_layer_offset)
+            % self.cs_npu_capture_layer_stride
+            != 0
+        ):
+            return False
+        if self.cs_npu_capture_max_layers > 0:
+            capture_idx = (
+                layer_id - self.cs_npu_capture_layer_offset
+            ) // self.cs_npu_capture_layer_stride
+            return capture_idx < self.cs_npu_capture_max_layers
+        return True
 
     def _csattention_local_topk_npu_graphsafe(
         self,
@@ -2004,10 +2040,22 @@ class Indexer(MultiPlatformOp):
         ):
             use_cs_by_len = False
             max_seq_len = 0
+            in_capture_mode = get_is_capture_mode()
             if actual_seq_lengths_kv.numel() > 0:
                 max_seq_len = int(actual_seq_lengths_kv.max().item())
                 use_cs_by_len = max_seq_len >= self.cs_long_context_threshold
 
+            if (
+                in_capture_mode
+                and self.cs_npu_enable_capture
+                and self.cs_npu_capture_ignore_seq_threshold
+            ):
+                # Captured graph path is static after capture. For local-graph
+                # experiments, allow selected layers to use CSAttention during
+                # capture regardless of warmup seq-len distribution.
+                use_cs_by_len = True
+
+            run_csattention = False
             if not use_cs_by_len:
                 if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
                     self.cs_debug_log_count += 1
@@ -2017,21 +2065,56 @@ class Indexer(MultiPlatformOp):
                         max_seq_len,
                         self.cs_long_context_threshold,
                     )
-            elif get_is_capture_mode() and not self.cs_npu_enable_capture:
-                if not self.cs_graph_capture_fallback_logged:
-                    _logger.warning(
-                        "NSA CSAttention is not graph-capture-safe on NPU yet. "
-                        "Falling back to npu_lightning_indexer during graph capture. "
-                        "Set SGLANG_NSA_CSATTENTION_NPU_ENABLE_CAPTURE=1 to try phase-2 path."
-                    )
-                    self.cs_graph_capture_fallback_logged = True
             else:
+                if in_capture_mode:
+                    if not self.cs_npu_enable_capture:
+                        if not self.cs_graph_capture_fallback_logged:
+                            _logger.warning(
+                                "NSA CSAttention is not graph-capture-safe on NPU yet. "
+                                "Falling back to npu_lightning_indexer during graph capture. "
+                                "Set SGLANG_NSA_CSATTENTION_NPU_ENABLE_CAPTURE=1 to try phase-2 path."
+                            )
+                            self.cs_graph_capture_fallback_logged = True
+                    elif self._should_use_csattention_npu_capture_layer(layer_id):
+                        run_csattention = True
+                        if (
+                            self.cs_debug
+                            and self.cs_debug_log_count < self.cs_debug_max_logs
+                        ):
+                            self.cs_debug_log_count += 1
+                            _logger.info(
+                                "NSA CSAttention capture-layer selected: layer=%s "
+                                "stride=%s offset=%s max_layers=%s",
+                                layer_id,
+                                self.cs_npu_capture_layer_stride,
+                                self.cs_npu_capture_layer_offset,
+                                self.cs_npu_capture_max_layers,
+                            )
+                    elif (
+                        self.cs_debug
+                        and self.cs_debug_log_count < self.cs_debug_max_logs
+                    ):
+                        self.cs_debug_log_count += 1
+                        _logger.info(
+                            "NSA CSAttention capture-layer skipped: layer=%s "
+                            "stride=%s offset=%s max_layers=%s; fallback to lightning",
+                            layer_id,
+                            self.cs_npu_capture_layer_stride,
+                            self.cs_npu_capture_layer_offset,
+                            self.cs_npu_capture_max_layers,
+                        )
+                else:
+                    run_csattention = True
+
+            if run_csattention:
                 if self.cs_debug and self.cs_debug_log_count < self.cs_debug_max_logs:
+                    self.cs_debug_log_count += 1
                     _logger.info(
                         "NSA CSAttention path selected in forward_npu: layer=%s "
-                        "forward_mode=decode_or_idle token_count=%s",
+                        "forward_mode=decode_or_idle token_count=%s capture=%s",
                         layer_id,
                         q.shape[0],
+                        in_capture_mode,
                     )
                 return self._get_topk_csattention_npu_decode(
                     layer_id=layer_id,

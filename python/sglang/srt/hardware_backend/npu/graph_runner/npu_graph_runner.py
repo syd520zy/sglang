@@ -82,12 +82,13 @@ class NPUGraphRunner(CudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        # 1+3 strategy for NPU:
-        # - keep graph for normal decode batches
-        # - bypass graph for long-context decode when CSAttention is enabled
+        # NPU CSAttention strategy:
+        # - default: keep decode on graph (enables layer-level local graph policy in indexer)
+        # - optional legacy mode: bypass graph for long-context decode batches
+        #   via SGLANG_NSA_CSATTENTION_NPU_GRAPH_OUTSIDE=1.
         self.nsa_csattention_enabled = get_bool_env_var("SGLANG_NSA_USE_CSATTENTION", "false")
         self.nsa_cs_graph_outside = get_bool_env_var(
-            "SGLANG_NSA_CSATTENTION_NPU_GRAPH_OUTSIDE", "true"
+            "SGLANG_NSA_CSATTENTION_NPU_GRAPH_OUTSIDE", "false"
         )
         self.nsa_cs_long_context_threshold = max(
             0, get_int_env_var("SGLANG_NSA_CS_LONG_CONTEXT_THRESHOLD", 16384)
@@ -250,7 +251,8 @@ class NPUGraphRunner(CudaGraphRunner):
         if max_seq_len >= self.nsa_cs_long_context_threshold:
             if not self._nsa_cs_bypass_graph_logged:
                 logger.info(
-                    "Bypass NPU graph for long-context CSAttention batch: "
+                    "Bypass NPU graph for long-context CSAttention batch "
+                    "(legacy full-outside mode): "
                     "max_seq_len=%s threshold=%s",
                     max_seq_len,
                     self.nsa_cs_long_context_threshold,
