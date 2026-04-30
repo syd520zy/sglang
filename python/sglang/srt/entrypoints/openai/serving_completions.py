@@ -193,6 +193,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
 
+        if error_response := self._create_error_response_from_streaming_chunk(
+            first_chunk
+        ):
+            await generator.aclose()
+            return error_response
+
         async def prepend_first_chunk():
             yield first_chunk
             async for chunk in generator:
@@ -319,7 +325,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
-                        code.name,
+                        finish_reason.get("err_type") or code.name,
                         code.value,
                     )
                     yield f"data: {error}\n\n"

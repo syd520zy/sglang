@@ -256,6 +256,54 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_abort_before_first_chunk_returns_http_error(self):
+        """Request-level streaming aborts should be returned as HTTP errors."""
+        err_msg = "Input is too long"
+        err_code = HTTPStatus.BAD_REQUEST
+
+        async def _mock_generate_abort(*args, **kwargs):
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                        "err_type": "BadRequestError",
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_abort
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            stream=True,
+        )
+
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        loop = get_or_create_event_loop()
+        response = loop.run_until_complete(
+            self.sc._handle_streaming_request(
+                adapted_request, req, self.fastapi_request
+            )
+        )
+
+        self.assertEqual(response.status_code, err_code.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["type"], "BadRequestError")
+        self.assertEqual(body["code"], err_code.value)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

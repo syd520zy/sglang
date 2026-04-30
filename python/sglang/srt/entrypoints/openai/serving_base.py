@@ -240,6 +240,40 @@ class OpenAIServingBase(ABC):
         )
         return json.dumps({"error": error.model_dump()})
 
+    def _create_error_response_from_streaming_chunk(
+        self, chunk: str
+    ) -> Optional[ORJSONResponse]:
+        """Convert a pre-fetched SSE error chunk back to an HTTP error response."""
+        if not chunk.startswith("data: "):
+            return None
+
+        data = chunk[len("data: ") :].strip()
+        if data == "[DONE]":
+            return None
+
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        status_code = error.get("code", 400)
+        if not isinstance(status_code, int):
+            status_code = 400
+
+        return self.create_error_response(
+            message=error.get("message", ""),
+            err_type=error.get("type", "BadRequestError"),
+            status_code=status_code,
+            param=error.get("param"),
+        )
+
     def extract_custom_labels(self, raw_request):
         if (
             not self.allowed_custom_labels

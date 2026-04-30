@@ -775,6 +775,64 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_abort_before_first_chunk_returns_http_error(self):
+        """Request-level streaming aborts should be returned as HTTP errors."""
+        err_msg = "Input is too long"
+        err_code = HTTPStatus.BAD_REQUEST
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                        "err_type": "BadRequestError",
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            temperature=0.7,
+            max_tokens=100,
+            stream=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+        loop = get_or_create_event_loop()
+        response = loop.run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, req, self.fastapi_request
+            )
+        )
+
+        self.assertEqual(response.status_code, err_code.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["type"], "BadRequestError")
+        self.assertEqual(body["code"], err_code.value)
+
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
         """Test that streaming with incremental_streaming_output produces correct deltas.
