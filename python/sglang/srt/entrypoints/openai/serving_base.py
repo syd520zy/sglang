@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import json
 import logging
+import traceback
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -15,11 +17,44 @@ from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingR
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import empty_device_cache
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_exception_traceback_and_device_cache(exc: BaseException) -> None:
+    """Release tensors held alive by exception tracebacks and clear device cache.
+
+    Some request-time failures can happen while large device tensors are still
+    referenced by frame locals in the exception traceback. Log the exception
+    before calling this helper, because clearing frames removes local variables
+    from the traceback.
+    """
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if cur.__traceback__ is not None:
+            traceback.clear_frames(cur.__traceback__)
+        if cur.__cause__ is not None:
+            stack.append(cur.__cause__)
+        if cur.__context__ is not None:
+            stack.append(cur.__context__)
+        stack.extend(getattr(cur, "exceptions", ()))
+
+    gc.collect()
+    try:
+        empty_device_cache()
+    except Exception as cleanup_error:
+        logger.debug(
+            "Failed to empty device cache after request error: %s", cleanup_error
+        )
 
 
 # Base class for specific endpoint handlers
@@ -126,6 +161,7 @@ class OpenAIServingBase(ABC):
             )
         except Exception as e:
             logger.exception(f"Error in request: {e}")
+            _cleanup_exception_traceback_and_device_cache(e)
             return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",

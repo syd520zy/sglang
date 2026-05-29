@@ -6,9 +6,13 @@ that enables OpenAI-compatible LoRA adapter selection.
 """
 
 import unittest
-from unittest.mock import MagicMock
+import weakref
+from unittest.mock import MagicMock, patch
 
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    _cleanup_exception_traceback_and_device_cache,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -140,6 +144,34 @@ class TestResolveLoraPath(unittest.TestCase):
             "org/model-v2.1:adapter-name", "other-adapter"
         )
         self.assertEqual(result, "adapter-name")
+
+
+class TestExceptionCleanup(unittest.TestCase):
+    """Test request exception cleanup utilities."""
+
+    def test_cleanup_clears_traceback_locals_and_empties_cache(self):
+        class Holder:
+            pass
+
+        def make_exception_with_local_ref():
+            holder = Holder()
+            holder_ref = weakref.ref(holder)
+            try:
+                raise RuntimeError("boom")
+            except RuntimeError as exc:
+                return exc, holder_ref
+
+        exc, holder_ref = make_exception_with_local_ref()
+        self.assertIsNotNone(holder_ref())
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_base.empty_device_cache",
+            return_value=True,
+        ) as mock_empty_cache:
+            _cleanup_exception_traceback_and_device_cache(exc)
+
+        mock_empty_cache.assert_called_once()
+        self.assertIsNone(holder_ref())
 
 
 class TestIntegrationScenarios(unittest.TestCase):
