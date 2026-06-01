@@ -20,8 +20,8 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
     run_dense_cuda_graph_decode_case,
 )
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=21, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(
