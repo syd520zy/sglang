@@ -13,7 +13,7 @@ import torch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.models.dflash import DFlashAttention
+from sglang.srt.models.dflash import DFlashAttention, DFlashDraftModel
 from sglang.srt.models.dspark import DSparkDraftMixin
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -69,8 +69,12 @@ def _make_model(rope, num_layers, **kw):
         for _ in range(num_layers)
     ]
     model = types.SimpleNamespace(layers=layers)
-    for name in ("_stacked_ctx_kv_params", "_project_ctx_kv_stacked"):
-        setattr(model, name, types.MethodType(getattr(DSparkDraftMixin, name), model))
+    model._stacked_ctx_kv_params = types.MethodType(
+        DSparkDraftMixin._stacked_ctx_kv_params, model
+    )
+    model._project_ctx_kv_stacked = types.MethodType(
+        DFlashDraftModel._project_ctx_kv_stacked, model
+    )
     return model
 
 

@@ -61,6 +61,33 @@ class TestCompactSeqLensHostBound(CustomTestCase):
         self.assertGreaterEqual(int(bound), int(exact_true))
 
 
+class TestDraftBlockBufferInit(CustomTestCase):
+    def test_mask_tail_is_initialized_once(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        worker = SimpleNamespace(
+            block_size=4,
+            device=torch.device("cpu"),
+            _mask_token_id=99,
+            _draft_block_ids_buf=None,
+            _draft_block_positions_buf=None,
+            _draft_block_tokens_buf=None,
+            _draft_verify_out_cache_loc_buf=None,
+            _draft_block_end_buf=None,
+            _draft_seq_lens_cpu_buf=None,
+        )
+
+        DFlashWorkerV2._ensure_draft_block_buffers(worker, 3)
+
+        self.assertEqual(tuple(worker._draft_block_ids_buf.shape), (3, 4))
+        torch.testing.assert_close(
+            worker._draft_block_ids_buf,
+            torch.full((3, 4), 99, dtype=torch.long),
+            rtol=0,
+            atol=0,
+        )
+
+
 class _FakeTpGroup:
     """Single-process stand-in for the TP GroupCoordinator: replays the
     concatenation of all ranks' recorded all-gather inputs."""

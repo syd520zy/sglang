@@ -665,8 +665,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
         device = self.device
         block_size = int(self.block_size)
-        self._draft_block_ids_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.long, device=device
+        self._draft_block_ids_buf = torch.full(
+            (new_cap, block_size),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
@@ -1385,6 +1388,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            stacked_kv = self._project_target_hidden_to_draft_kv_stacked(
+                ctx_hidden=ctx_hidden, ctx_positions=positions
+            )
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1413,16 +1419,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
-                for layer in self.draft_model.layers:
+                for i, layer in enumerate(self.draft_model.layers):
                     attn = layer.self_attn
-                    layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
-                        layer, ctx_hidden
-                    )
-                    k, v = attn.kv_proj_only(layer_ctx_hidden)
-                    k = attn.apply_k_norm(k)
-                    k = attn.apply_k_rope(positions, k)
-                    k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+                    if stacked_kv is not None:
+                        k, v = stacked_kv[0][i], stacked_kv[1][i]
+                    else:
+                        layer_ctx_hidden = (
+                            self.draft_model.prepare_context_hidden_for_kv(
+                                layer, ctx_hidden
+                            )
+                        )
+                        k, v = attn.kv_proj_only(layer_ctx_hidden)
+                        k = attn.apply_k_norm(k)
+                        k = attn.apply_k_rope(positions, k)
+                        k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                        v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
@@ -1463,19 +1474,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
-        for layer in self.draft_model.layers:
+        stacked_kv = self._project_target_hidden_to_draft_kv_stacked(
+            ctx_hidden=ctx_hidden, ctx_positions=ctx_positions
+        )
+        for i, layer in enumerate(self.draft_model.layers):
             attn = layer.self_attn
-            layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
-                layer, ctx_hidden
-            )
-            if _is_npu:
-                _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
+            if stacked_kv is not None:
+                k, v = stacked_kv[0][i], stacked_kv[1][i]
             else:
-                k, v = attn.kv_proj_only(layer_ctx_hidden)
-                k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(ctx_positions, k)
-            k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+                layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                    layer, ctx_hidden
+                )
+                if _is_npu:
+                    _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
+                else:
+                    k, v = attn.kv_proj_only(layer_ctx_hidden)
+                    k = attn.apply_k_norm(k)
+                    k = attn.apply_k_rope(ctx_positions, k)
+                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 ctx_cache_loc,
@@ -1484,6 +1501,48 @@ class DFlashWorkerV2(BaseSpecWorker):
                 attn.attn.k_scale,
                 attn.attn.v_scale,
             )
+
+    def _project_target_hidden_to_draft_kv_stacked(
+        self, *, ctx_hidden: torch.Tensor, ctx_positions: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not _is_npu:
+            return None
+
+        log_message = None
+        if not envs.SGLANG_DFLASH_STACKED_CTX_KV.get():
+            log_message = "disabled by SGLANG_DFLASH_STACKED_CTX_KV"
+        elif not self.draft_model.supports_fused_context_kv:
+            log_message = "fallback: draft model does not support shared context KV"
+
+        if log_message is not None:
+            if not getattr(self, "_logged_stacked_ctx_kv_status", False):
+                if self.ps.tp_rank == 0:
+                    logger.info("DFLASH NPU stacked context-KV %s.", log_message)
+                self._logged_stacked_ctx_kv_status = True
+            return None
+
+        stacked = self.draft_model._stacked_ctx_kv_params()
+        if stacked is None:
+            if not getattr(self, "_logged_stacked_ctx_kv_status", False):
+                if self.ps.tp_rank == 0:
+                    logger.info(
+                        "DFLASH NPU stacked context-KV fallback: "
+                        "incompatible or quantized QKV projections."
+                    )
+                self._logged_stacked_ctx_kv_status = True
+            return None
+        if not getattr(self, "_logged_stacked_ctx_kv_status", False):
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH NPU stacked context-KV enabled: layers=%d.",
+                    len(self.draft_model.layers),
+                )
+            self._logged_stacked_ctx_kv_status = True
+        return self.draft_model._project_ctx_kv_stacked(
+            ctx_hidden=ctx_hidden,
+            positions=ctx_positions,
+            stacked=stacked,
+        )
 
     def _append_target_hidden_fused(
         self,
@@ -1927,7 +1986,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
         else:
-            block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
             torch.add(
                 prefix_lens.unsqueeze(1),
