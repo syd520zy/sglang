@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import json
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
@@ -50,9 +50,6 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     Qwen3MLP,
     _sdpa_attn_func,
     create_block_causal_mask,
-    npu_fia_enabled,
-    npu_fused_mlp_enabled,
-    npu_fused_norm_enabled,
     position_ids_from_indexes,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -350,41 +347,37 @@ def test_sensenova_u1_right_aligns_bnsd_prefix_for_npu_fia():
 @pytest.mark.parametrize("value", ["0", "false", "off"])
 def test_sensenova_u1_npu_fia_can_be_disabled(monkeypatch, value):
     monkeypatch.setenv("SGLANG_SENSENOVA_NPU_FIA", value)
-    assert not npu_fia_enabled()
+    assert not envs.SGLANG_SENSENOVA_NPU_FIA
 
 
 def test_sensenova_u1_npu_fia_is_enabled_by_default(monkeypatch):
     monkeypatch.delenv("SGLANG_SENSENOVA_NPU_FIA", raising=False)
-    assert npu_fia_enabled()
+    assert envs.SGLANG_SENSENOVA_NPU_FIA
 
 
 @pytest.mark.parametrize(
-    ("env_name", "enabled"),
+    "env_name",
     [
-        ("SGLANG_SENSENOVA_NPU_FUSED_NORM", npu_fused_norm_enabled),
-        ("SGLANG_SENSENOVA_NPU_FUSED_MLP", npu_fused_mlp_enabled),
+        "SGLANG_SENSENOVA_NPU_FUSED_NORM",
+        "SGLANG_SENSENOVA_NPU_FUSED_MLP",
     ],
 )
 @pytest.mark.parametrize("value", ["0", "false", "off"])
-def test_sensenova_u1_npu_fused_ops_can_be_disabled(
-    monkeypatch, env_name, enabled, value
-):
+def test_sensenova_u1_npu_fused_ops_can_be_disabled(monkeypatch, env_name, value):
     monkeypatch.setenv(env_name, value)
-    assert not enabled()
+    assert not getattr(envs, env_name)
 
 
 @pytest.mark.parametrize(
-    ("env_name", "enabled"),
+    "env_name",
     [
-        ("SGLANG_SENSENOVA_NPU_FUSED_NORM", npu_fused_norm_enabled),
-        ("SGLANG_SENSENOVA_NPU_FUSED_MLP", npu_fused_mlp_enabled),
+        "SGLANG_SENSENOVA_NPU_FUSED_NORM",
+        "SGLANG_SENSENOVA_NPU_FUSED_MLP",
     ],
 )
-def test_sensenova_u1_npu_fused_ops_are_enabled_by_default(
-    monkeypatch, env_name, enabled
-):
+def test_sensenova_u1_npu_fused_ops_are_enabled_by_default(monkeypatch, env_name):
     monkeypatch.delenv(env_name, raising=False)
-    assert enabled()
+    assert getattr(envs, env_name)
 
 
 @torch.no_grad()
@@ -401,14 +394,11 @@ def test_sensenova_u1_fused_dense_mlp_matches_original(monkeypatch):
         expected = mlp(hidden_states)
 
     monkeypatch.setattr(mlp, "_use_npu_fused_mlp", lambda _x: True)
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_npu",
-        SimpleNamespace(
-            npu_swiglu=lambda x, dim=-1: (
-                F.silu(x.chunk(2, dim=dim)[0]) * x.chunk(2, dim=dim)[1]
-            )
-        ),
+    monkeypatch.setattr(
+        torch.ops.npu,
+        "npu_swiglu",
+        lambda x, dim=-1: F.silu(x.chunk(2, dim=dim)[0]) * x.chunk(2, dim=dim)[1],
+        raising=False,
     )
     actual = mlp(hidden_states)
 

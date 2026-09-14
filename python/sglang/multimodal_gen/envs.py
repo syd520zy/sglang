@@ -49,6 +49,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
+    SGLANG_SENSENOVA_NPU_FIA: bool = True
+    SGLANG_SENSENOVA_NPU_FUSED_NORM: bool = True
+    SGLANG_SENSENOVA_NPU_FUSED_MLP: bool = True
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
@@ -163,6 +166,13 @@ def _lazy_path(
 # begin-env-vars-definition
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "SGLANG_SENSENOVA_NPU_FIA": _lazy_bool("SGLANG_SENSENOVA_NPU_FIA", "true"),
+    "SGLANG_SENSENOVA_NPU_FUSED_NORM": _lazy_bool(
+        "SGLANG_SENSENOVA_NPU_FUSED_NORM", "true"
+    ),
+    "SGLANG_SENSENOVA_NPU_FUSED_MLP": _lazy_bool(
+        "SGLANG_SENSENOVA_NPU_FUSED_MLP", "true"
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of sglang-diffusion, supporting [cuda (by default),
     # rocm, neuron, cpu, openvino]

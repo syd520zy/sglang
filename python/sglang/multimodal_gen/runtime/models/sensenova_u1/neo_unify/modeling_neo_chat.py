@@ -13,6 +13,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.multimodal_gen import envs
+
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_fm_modules import (
@@ -24,7 +26,6 @@ from .modeling_neo_vit import NEOVisionModel
 from .modeling_qwen3 import (
     Qwen3ForCausalLM,
     create_block_causal_mask,
-    npu_fia_enabled,
 )
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
@@ -93,7 +94,9 @@ def prepare_flash_kv_cache(
         total_len = prefix_len + current_len
 
         use_npu_fia = (
-            past_k.device.type == "npu" and lengths is not None and npu_fia_enabled()
+            past_k.device.type == "npu"
+            and lengths is not None
+            and envs.SGLANG_SENSENOVA_NPU_FIA
         )
         if use_npu_fia:
             if any(length < 0 or length > prefix_len for length in lengths):
@@ -2655,7 +2658,7 @@ class NEOChatModel(PreTrainedModel):
             denoise_key_valid_mask = torch.cat(
                 [condition_key_valid_mask, image_key_valid_mask], dim=1
             )
-            if not npu_fia_enabled():
+            if not envs.SGLANG_SENSENOVA_NPU_FIA:
                 attention_mask_condition["full_attention"] = denoise_key_valid_mask[
                     :, None, None, :
                 ]

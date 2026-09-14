@@ -9,7 +9,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
-    SENSENOVA_U1_RESOLUTION_ALIGNMENT,
+    RESOLUTION_ALIGNMENT,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -88,8 +88,8 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         return current_platform.is_npu()
 
     def estimate_request_cost(self, batch) -> float:
-        image_tokens = (int(batch.width) // SENSENOVA_U1_RESOLUTION_ALIGNMENT) * (
-            int(batch.height) // SENSENOVA_U1_RESOLUTION_ALIGNMENT
+        image_tokens = (int(batch.width) // RESOLUTION_ALIGNMENT) * (
+            int(batch.height) // RESOLUTION_ALIGNMENT
         )
         cfg_branches = 2 if float(batch.guidance_scale) > 1 else 1
         return float(

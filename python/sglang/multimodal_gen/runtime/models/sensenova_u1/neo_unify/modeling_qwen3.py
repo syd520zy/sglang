@@ -1,7 +1,6 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
 import copy
-import os
 from typing import Callable, Optional, Union
 
 import torch
@@ -31,6 +30,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
+from sglang.multimodal_gen import envs
+
 from .transformers_compat import (
     causal_mask_kwargs,
     model_input_compat,
@@ -55,30 +56,6 @@ except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash 
 #                    debugging, even when flash-attn is available).
 _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
 _ATTN_BACKEND: str = "auto"
-
-
-def npu_fia_enabled() -> bool:
-    return os.getenv("SGLANG_SENSENOVA_NPU_FIA", "1").lower() not in (
-        "0",
-        "false",
-        "off",
-    )
-
-
-def npu_fused_norm_enabled() -> bool:
-    return os.getenv("SGLANG_SENSENOVA_NPU_FUSED_NORM", "1").lower() not in (
-        "0",
-        "false",
-        "off",
-    )
-
-
-def npu_fused_mlp_enabled() -> bool:
-    return os.getenv("SGLANG_SENSENOVA_NPU_FUSED_MLP", "1").lower() not in (
-        "0",
-        "false",
-        "off",
-    )
 
 
 def set_attn_backend(backend: str) -> str:
@@ -213,10 +190,8 @@ def _flash_or_sdpa(
         and not causal
         and dropout_p == 0.0
         and actual_seq_lengths_kv is not None
-        and npu_fia_enabled()
+        and envs.SGLANG_SENSENOVA_NPU_FIA
     ):
-        import torch_npu
-
         if input_layout == "BNSD":
             q_bhsd, k_bhsd, v_bhsd = q, k, v
             batch_size, num_heads, query_length, _ = q.shape
@@ -229,7 +204,7 @@ def _flash_or_sdpa(
             num_key_value_heads = k.shape[2]
         else:
             raise ValueError(f"Unsupported attention input layout: {input_layout}")
-        out, _ = torch_npu.npu_fused_infer_attention_score(
+        out, _ = torch.ops.npu.npu_fused_infer_attention_score(
             q_bhsd,
             k_bhsd,
             v_bhsd,
@@ -318,11 +293,9 @@ class Qwen3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.device.type == "npu" and npu_fused_norm_enabled():
-            import torch_npu
-
-            if hasattr(torch_npu, "npu_rms_norm"):
-                return torch_npu.npu_rms_norm(
+        if hidden_states.device.type == "npu" and envs.SGLANG_SENSENOVA_NPU_FUSED_NORM:
+            if hasattr(torch.ops.npu, "npu_rms_norm"):
+                return torch.ops.npu.npu_rms_norm(
                     hidden_states, self.weight, self.variance_epsilon
                 )[0]
         input_dtype = hidden_states.dtype
@@ -376,21 +349,15 @@ class Qwen3MLP(nn.Module):
             or x.dtype != torch.bfloat16
             or self.gate_proj.weight.dtype != x.dtype
             or self.config.hidden_act != "silu"
-            or not npu_fused_mlp_enabled()
+            or not envs.SGLANG_SENSENOVA_NPU_FUSED_MLP
         ):
             return False
-        try:
-            import torch_npu
-        except ImportError:
-            return False
-        return hasattr(torch_npu, "npu_swiglu")
+        return hasattr(torch.ops.npu, "npu_swiglu")
 
     def forward(self, x):
         if self._use_npu_fused_mlp(x):
-            import torch_npu
-
             gate_up = F.linear(x, self._pack_npu_gate_up_weights())
-            return self.down_proj(torch_npu.npu_swiglu(gate_up))
+            return self.down_proj(torch.ops.npu.npu_swiglu(gate_up))
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 

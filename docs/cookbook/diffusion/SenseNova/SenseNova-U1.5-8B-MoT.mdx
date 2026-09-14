@@ -78,7 +78,107 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### 4.2 Advanced usage: Ascend request batching
+
+On Linux with an existing SGLang Ascend environment (`torch_npu` and CANN), you
+can batch compatible text-to-image requests on one NPU. This path was tested on
+Ascend 910C with BF16. Use a local model directory containing the complete
+SenseNova-U1.5-8B-MoT checkpoint and tokenizer.
+
+```bash
+export MODEL_PATH=/model/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
+sglang serve \
+  --model-path "$MODEL_PATH" \
+  --num-gpus 1 --port 30000 \
+  --batching-max-size 2 --batching-delay-ms 100 \
+  --enable-batching-metrics
+```
+
+Send at least two concurrent requests. Requests may have different prompts and
+seeds, but must share resolution, sampling steps, CFG settings, and output
+options. Each merged request must request one image and disable think mode.
+Multi-output requests continue through sequential output generation.
+The default maximum batch size is 1. Confirm actual batching in the server log
+(`Processed dynamic batch of 2/2`); the configured maximum alone is insufficient.
+
+SenseNova uses native FIA denoise attention, fused RMSNorm, and dense MLP
+gate/up fusion on NPU. The three switches below default to `1`; set individual
+switches to `0` before server startup for an ablation, then restart the server:
+
+```bash
+export SGLANG_SENSENOVA_NPU_FIA=0
+export SGLANG_SENSENOVA_NPU_FUSED_NORM=0
+export SGLANG_SENSENOVA_NPU_FUSED_MLP=0
+```
+
+Disabling FIA restores SDPA with an explicit padding mask for batched requests.
+MLP weights are packed on the first NPU forward, so warm up before measuring.
+Batching is currently enabled only on NPU because GPU batching validation is
+pending. CPU/CUDA operator selection is unchanged. This path does not combine
+the two CFG branches into a single forward and does not add graph capture,
+image-to-image batching, or tensor parallelism.
+
+### 4.3 Reproduce the Ascend benchmark
+
+Run these commands from the repository root in a second terminal after the
+server is ready. The script uses fixed prompts and seeds without downloading a
+dataset. Use a fresh result directory for each server configuration.
+
+```bash
+export MODEL_PATH=/model/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
+export RESULT=/workspace/sensenova-results/b2-optimized
+python3 benchmark/sensenova/validate_npu_batching.py \
+  --model "$MODEL_PATH" --requests 4 --concurrency 4 \
+  --size 1024 --steps 5 --cfg 4 --warmup 0 --save-images \
+  --output "$RESULT/smoke"
+python3 benchmark/sensenova/validate_npu_batching.py \
+  --model "$MODEL_PATH" --requests 4 --concurrency 4 \
+  --size 2048 --steps 50 --cfg 4 --warmup 4 \
+  --output "$RESULT/perf"
+```
+
+The smoke run must report four successes, no failures, and four readable images.
+Repeat it with `--cfg 1` and a new output directory to check generation without
+CFG. For performance, restart the server for each B1/B2 configuration and keep
+all other settings fixed. The four warmup requests are excluded from timing.
+Compare `outputs_per_s` and `duration_s` in `result.json`; `mean_latency_s`
+includes server queueing. Inspect the formal run's server logs for real batches.
+
+The optional attention microbenchmark isolates padding-mask overhead and the
+batch-versus-singleton tradeoff at SenseNova shapes. It complements the generic
+Ascend op-plugin operator correctness tests; it is not an end-to-end speed result.
+Stop the model server before running it:
+
+```bash
+python3 benchmark/sensenova/bench_npu_attention.py \
+  --query-length 4096 --short-prefix-length 260 --long-prefix-length 286 \
+  --heads 32 --kv-heads 8 --head-dim 128 \
+  --warmup 5 --iterations 20 --native-fia \
+  --output /workspace/sensenova-results/attention.json
+```
+
 ## 5. Benchmark
+
+### Ascend 910C request batching
+
+Single 910C, BF16, four requests at concurrency four, 2048 × 2048, 50 steps,
+CFG 4, one image per request. Each configuration completed one measured round;
+repeat-run dispersion was not measured. These development measurements predate
+the review refactor. The disabled control uses the same feature branch with the
+three operator switches off; it is not an upstream-main baseline.
+
+| Configuration | Duration (s) | Throughput (images/s) | Mean latency (s) | Peak reserved memory (MB) |
+| --- | ---: | ---: | ---: | ---: |
+| B1, operator switches off | 234.28 | 0.01707 | 146.47 | 35698 |
+| B2, operator switches off | 234.83 | 0.01703 | 176.06 | 37870 |
+| B1, FIA + RMSNorm + MLP | 205.94 | 0.01942 | 128.80 | 35718 |
+| B2, FIA + RMSNorm + MLP | 195.02 | 0.02051 | 146.33 | 37850 |
+
+With the operator optimizations enabled, B2 improves throughput by 5.60% over B1.
+Optimized B2 improves throughput by 20.13% over the B1 disabled control, while
+mean latency is nearly unchanged. Four requests are sufficient for a development
+comparison but do not establish production tail latency or statistical confidence.
+Images were visually inspected; full-model numerical equivalence remains pending.
 
 ### 5.1 Speedup Benchmark
 

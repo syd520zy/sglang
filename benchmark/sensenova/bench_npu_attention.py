@@ -1,4 +1,8 @@
-"""Microbenchmark the NPU SDPA path used by SenseNova denoising."""
+"""Compare SenseNova denoise batching, padding-mask overhead, and native FIA.
+
+Unlike op-plugin operator tests, this benchmark measures the workload tradeoff
+between two compact singleton calls and a padded batch at SenseNova shapes.
+"""
 
 import argparse
 import json
@@ -8,7 +12,7 @@ import time
 from pathlib import Path
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--query-length", type=int, default=4096)
     parser.add_argument("--short-prefix-length", type=int, default=260)
@@ -37,13 +41,12 @@ def main():
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("warmup must be nonnegative and iterations must be positive")
 
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists():
-        raise FileExistsError(f"Refusing to overwrite existing result: {output}")
+    return args
 
+
+def build_cases(args):
     import torch
-    import torch_npu
+    import torch_npu  # noqa: F401 - register NPU operators
 
     if not torch.npu.is_available():
         raise RuntimeError("No NPU is available")
@@ -108,101 +111,138 @@ def main():
         "two_compact_singletons": two_compact_singletons,
     }
 
-    native_fia = None
-    native_fia_left = None
     if args.native_fia:
-        short_key_length = args.short_prefix_length + query_length
-        right_padded_k = k.clone()
-        right_padded_v = v.clone()
-        right_padded_k[0, :, args.short_prefix_length : short_key_length].copy_(
-            k[0, :, args.long_prefix_length :]
+        cases.update(build_native_cases(args, q, k, v))
+
+    return cases, dict(
+        q=q,
+        k=k,
+        v=v,
+        all_true_mask=all_true_mask,
+        mixed_mask=mixed_mask,
+        compact_k0=compact_k0,
+        compact_v0=compact_v0,
+        attention=attention,
+    )
+
+
+def build_native_cases(args, q, k, v):
+    import torch
+
+    batch_size, _, query_length, _ = q.shape
+    device = q.device
+    scale = 1.0 / math.sqrt(args.head_dim)
+    cases = {}
+    short_key_length = args.short_prefix_length + query_length
+    right_padded_k = k.clone()
+    right_padded_v = v.clone()
+    right_padded_k[0, :, args.short_prefix_length : short_key_length].copy_(
+        k[0, :, args.long_prefix_length :]
+    )
+    right_padded_v[0, :, args.short_prefix_length : short_key_length].copy_(
+        v[0, :, args.long_prefix_length :]
+    )
+    right_padded_k[0, :, short_key_length:].zero_()
+    right_padded_v[0, :, short_key_length:].zero_()
+    actual_seq_lengths = [query_length] * batch_size
+    actual_seq_lengths_kv = [
+        short_key_length,
+        args.long_prefix_length + query_length,
+    ]
+
+    def native_fia():
+        result, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q,
+            right_padded_k,
+            right_padded_v,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            num_heads=args.heads,
+            num_key_value_heads=args.kv_heads,
+            scale=scale,
+            input_layout="BNSD",
+            sparse_mode=0,
         )
-        right_padded_v[0, :, args.short_prefix_length : short_key_length].copy_(
-            v[0, :, args.long_prefix_length :]
+        return result
+
+    cases["native_fia_b2_right_padded"] = native_fia
+
+    left_padding = args.long_prefix_length - args.short_prefix_length
+    left_padded_k = k.clone()
+    left_padded_v = v.clone()
+    left_padded_k[0, :, :left_padding].zero_()
+    left_padded_v[0, :, :left_padding].zero_()
+    left_padded_k[0, :, left_padding : args.long_prefix_length].copy_(
+        k[0, :, : args.short_prefix_length]
+    )
+    left_padded_v[0, :, left_padding : args.long_prefix_length].copy_(
+        v[0, :, : args.short_prefix_length]
+    )
+    kv_padding_size = torch.zeros(1, device=device, dtype=torch.int64)
+
+    def native_fia_left():
+        result, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q,
+            left_padded_k,
+            left_padded_v,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            kv_padding_size=kv_padding_size,
+            num_heads=args.heads,
+            num_key_value_heads=args.kv_heads,
+            scale=scale,
+            input_layout="BNSD",
+            sparse_mode=0,
         )
-        right_padded_k[0, :, short_key_length:].zero_()
-        right_padded_v[0, :, short_key_length:].zero_()
-        actual_seq_lengths = [query_length] * batch_size
-        actual_seq_lengths_kv = [
-            short_key_length,
-            args.long_prefix_length + query_length,
-        ]
+        return result
 
-        def native_fia():
-            result, _ = torch_npu.npu_fused_infer_attention_score(
-                q,
-                right_padded_k,
-                right_padded_v,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                num_heads=args.heads,
-                num_key_value_heads=args.kv_heads,
-                scale=scale,
-                input_layout="BNSD",
-                sparse_mode=0,
-            )
-            return result
+    cases["native_fia_b2_left_padded"] = native_fia_left
 
-        cases["native_fia_b2_right_padded"] = native_fia
+    return cases
 
-        left_padding = args.long_prefix_length - args.short_prefix_length
-        left_padded_k = k.clone()
-        left_padded_v = v.clone()
-        left_padded_k[0, :, :left_padding].zero_()
-        left_padded_v[0, :, :left_padding].zero_()
-        left_padded_k[0, :, left_padding : args.long_prefix_length].copy_(
-            k[0, :, : args.short_prefix_length]
-        )
-        left_padded_v[0, :, left_padding : args.long_prefix_length].copy_(
-            v[0, :, : args.short_prefix_length]
-        )
-        kv_padding_size = torch.zeros(1, device=device, dtype=torch.int64)
 
-        def native_fia_left():
-            result, _ = torch_npu.npu_fused_infer_attention_score(
-                q,
-                left_padded_k,
-                left_padded_v,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                kv_padding_size=kv_padding_size,
-                num_heads=args.heads,
-                num_key_value_heads=args.kv_heads,
-                scale=scale,
-                input_layout="BNSD",
-                sparse_mode=0,
-            )
-            return result
+def measure(fn, args):
+    import torch
 
-        cases["native_fia_b2_left_padded"] = native_fia_left
-
-    def measure(fn):
-        for _ in range(args.warmup):
-            fn()
+    for _ in range(args.warmup):
+        fn()
+    torch.npu.synchronize()
+    samples = []
+    for _ in range(args.iterations):
+        start = time.perf_counter()
+        fn()
         torch.npu.synchronize()
-        samples = []
-        for _ in range(args.iterations):
-            start = time.perf_counter()
-            fn()
-            torch.npu.synchronize()
-            samples.append((time.perf_counter() - start) * 1000)
-        return {
-            "median_ms": statistics.median(samples),
-            "mean_ms": statistics.fmean(samples),
-            "min_ms": min(samples),
-            "max_ms": max(samples),
-        }
+        samples.append((time.perf_counter() - start) * 1000)
+    return {
+        "median_ms": statistics.median(samples),
+        "mean_ms": statistics.fmean(samples),
+        "min_ms": min(samples),
+        "max_ms": max(samples),
+    }
 
-    def error(reference, actual):
-        diff = (reference.float() - actual.float()).abs()
-        return {
-            "max_abs": diff.max().item(),
-            "mean_abs": diff.mean().item(),
-            "allclose": torch.allclose(
-                reference.float(), actual.float(), atol=args.atol, rtol=args.rtol
-            ),
-        }
 
+def error(reference, actual, args):
+    import torch
+
+    diff = (reference.float() - actual.float()).abs()
+    return {
+        "max_abs": diff.max().item(),
+        "mean_abs": diff.mean().item(),
+        "allclose": torch.allclose(
+            reference.float(), actual.float(), atol=args.atol, rtol=args.rtol
+        ),
+    }
+
+
+def check_correctness(cases, inputs, args):
+    import torch
+
+    q, k, v = (inputs[name] for name in ("q", "k", "v"))
+    attention = inputs["attention"]
+    all_true_mask, mixed_mask = inputs["all_true_mask"], inputs["mixed_mask"]
+    compact_k0, compact_v0 = inputs["compact_k0"], inputs["compact_v0"]
+    native_fia = cases.get("native_fia_b2_right_padded")
+    native_fia_left = cases.get("native_fia_b2_left_padded")
     with torch.inference_mode():
         no_mask = attention(q, k, v)
         all_true = attention(q, k, v, all_true_mask)
@@ -210,31 +250,34 @@ def main():
         compact0 = attention(q[0:1], compact_k0, compact_v0)
         compact1 = attention(q[1:2], k[1:2], v[1:2])
         correctness = {
-            "all_true_vs_no_mask": error(no_mask, all_true),
-            "mixed_short_vs_compact": error(compact0, mixed[0:1]),
-            "mixed_long_vs_compact": error(compact1, mixed[1:2]),
+            "all_true_vs_no_mask": error(no_mask, all_true, args),
+            "mixed_short_vs_compact": error(compact0, mixed[0:1], args),
+            "mixed_long_vs_compact": error(compact1, mixed[1:2], args),
         }
         if native_fia is not None:
             native = native_fia()
-            correctness["native_fia_short_vs_compact"] = error(compact0, native[0:1])
-            correctness["native_fia_long_vs_compact"] = error(compact1, native[1:2])
+            correctness["native_fia_short_vs_compact"] = error(
+                compact0, native[0:1], args
+            )
+            correctness["native_fia_long_vs_compact"] = error(
+                compact1, native[1:2], args
+            )
             del native
         if native_fia_left is not None:
             native_left = native_fia_left()
             correctness["native_fia_left_short_vs_compact"] = error(
-                compact0, native_left[0:1]
+                compact0, native_left[0:1], args
             )
             correctness["native_fia_left_long_vs_compact"] = error(
-                compact1, native_left[1:2]
+                compact1, native_left[1:2], args
             )
             del native_left
         del no_mask, all_true, mixed, compact0, compact1
 
-        measurements = {}
-        for name, fn in cases.items():
-            measurements[name] = measure(fn)
-            print(json.dumps({"case": name, **measurements[name]}), flush=True)
+    return correctness
 
+
+def summarize(measurements, args):
     b1 = measurements["b1_long_no_mask"]["median_ms"]
     b2 = measurements["b2_no_mask"]["median_ms"]
     all_true = measurements["b2_all_true_mask"]["median_ms"]
@@ -261,26 +304,52 @@ def main():
                 "native_fia_left_b2_throughput_speedup_vs_b1": 2 * b1 / native_left,
             }
         )
+    return derived
+
+
+def main():
+    args = parse_args()
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        raise FileExistsError(f"Refusing to overwrite existing result: {output}")
+    cases, inputs = build_cases(args)
+    correctness = check_correctness(cases, inputs, args)
+    if not all(item["allclose"] for item in correctness.values()):
+        output.write_text(json.dumps({"correctness": correctness}, indent=2))
+        raise RuntimeError("Attention correctness check failed; see the JSON result")
+    import torch
+    import torch_npu
+
+    with torch.inference_mode():
+        measurements = {name: measure(fn, args) for name, fn in cases.items()}
+    derived = summarize(measurements, args)
     result = {
         "config": {
             **vars(args),
-            "dtype": str(dtype),
+            "dtype": str(inputs["q"].dtype),
             "device": torch.npu.get_device_name(0),
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
-            "q_shape": list(shape_q),
-            "kv_shape": list(shape_kv),
+            "q_shape": list(inputs["q"].shape),
+            "kv_shape": list(inputs["k"].shape),
         },
         "correctness": correctness,
         "measurements": measurements,
         "derived": derived,
     }
     output.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps({"correctness": correctness, "derived": derived}, indent=2))
+    print(
+        json.dumps(
+            {
+                "correctness": correctness,
+                "measurements": measurements,
+                "derived": derived,
+            },
+            indent=2,
+        )
+    )
     print(f"Wrote {output}")
-
-    if not all(item["allclose"] for item in correctness.values()):
-        raise RuntimeError("Attention correctness check failed; see the JSON result")
 
 
 if __name__ == "__main__":
