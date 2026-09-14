@@ -93,6 +93,12 @@ def prepare_flash_kv_cache(
         # original cache layout: [B, H, S, D]
         prefix_len = past_k.shape[2]
         total_len = prefix_len + current_len
+        if lengths is not None and any(
+            length < 0 or length > prefix_len for length in lengths
+        ):
+            raise ValueError(
+                f"Prefix lengths must be between 0 and {prefix_len}, got {lengths}"
+            )
 
         use_npu_fia = (
             past_k.device.type == "npu"
@@ -100,10 +106,6 @@ def prepare_flash_kv_cache(
             and envs.SGLANG_SENSENOVA_NPU_FIA
         )
         if use_npu_fia:
-            if any(length < 0 or length > prefix_len for length in lengths):
-                raise ValueError(
-                    f"Prefix lengths must be between 0 and {prefix_len}, got {lengths}"
-                )
             k_cache = torch.empty(
                 (batch_size, past_k.shape[1], total_len, past_k.shape[3]),
                 device=past_k.device,
@@ -138,7 +140,11 @@ def prepare_flash_kv_cache(
             )
             k_cache[:, :prefix_len].copy_(past_k_flash)
             v_cache[:, :prefix_len].copy_(past_v_flash)
-            layer.flash_actual_seq_lengths_kv = None
+            layer.flash_actual_seq_lengths_kv = (
+                None
+                if lengths is None
+                else [length + current_len for length in lengths]
+            )
             layer.flash_kv_padding_size = None
             layer.flash_cache_layout = "BSND"
 
@@ -2498,7 +2504,7 @@ class NEOChatModel(PreTrainedModel):
             input_ids_condition,
             indexes_condition,
             attention_mask_condition_prefix,
-            condition_key_valid_mask,
+            _,
             condition_prefix_lengths,
         ) = self._build_t2i_text_inputs(tokenizer, query_condition)
         if query_uncondition is not None:
@@ -2620,16 +2626,14 @@ class NEOChatModel(PreTrainedModel):
             past_key_values_condition,
             current_len=token_h * token_w,
             batch_size=batch_size,
-            prefix_lengths=(condition_prefix_lengths if device.type == "npu" else None),
+            prefix_lengths=condition_prefix_lengths,
         )
         if past_key_values_uncondition is not None:
             prepare_flash_kv_cache(
                 past_key_values_uncondition,
                 current_len=token_h * token_w,
                 batch_size=batch_size,
-                prefix_lengths=(
-                    uncondition_prefix_lengths if device.type == "npu" else None
-                ),
+                prefix_lengths=uncondition_prefix_lengths,
             )
 
         # init noise image tokens
@@ -2653,27 +2657,6 @@ class NEOChatModel(PreTrainedModel):
         )
 
         attention_mask_condition = {"full_attention": None}
-        if device.type in ("npu", "cuda") and batch_size > 1:
-            condition_key_valid_mask = condition_key_valid_mask.expand(batch_size, -1)
-            image_key_valid_mask = torch.ones(
-                (batch_size, token_h * token_w),
-                dtype=torch.bool,
-                device=device,
-            )
-            denoise_key_valid_mask = torch.cat(
-                [condition_key_valid_mask, image_key_valid_mask], dim=1
-            )
-            if device.type != "npu" or not envs.SGLANG_SENSENOVA_NPU_FIA:
-                attention_mask_condition["full_attention"] = denoise_key_valid_mask[
-                    :, None, None, :
-                ]
-                # Ascend FlashAttention requires an explicit query dimension.
-                # Materialize once and reuse across all layers and denoise steps.
-                attention_mask_condition["full_attention"] = (
-                    attention_mask_condition["full_attention"]
-                    .expand(-1, -1, token_h * token_w, -1)
-                    .contiguous()
-                )
         attention_mask_uncondition = {"full_attention": None}
 
         timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)

@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3MLP,
+    _flash_or_sdpa,
     _sdpa_attn_func,
     create_block_causal_mask,
     position_ids_from_indexes,
@@ -430,6 +431,28 @@ def test_sensenova_u1_batched_gqa_matches_unpadded_singletons():
         torch.testing.assert_close(actual[i : i + 1], expected)
 
 
+def test_sensenova_u1_compacts_variable_length_kv_before_attention():
+    generator = torch.Generator().manual_seed(29)
+    q = torch.randn(2, 3, 4, 8, generator=generator)
+    k = torch.randn(2, 8, 2, 8, generator=generator)
+    v = torch.randn(2, 8, 2, 8, generator=generator)
+    actual = _flash_or_sdpa(
+        q,
+        k,
+        v,
+        attention_mask=torch.ones(2, 1, 3, 8, dtype=torch.bool),
+        actual_seq_lengths_kv=[5, 8],
+    )
+
+    expected_short = _sdpa_attn_func(
+        q[:1],
+        torch.cat((k[:1, :2], k[:1, 5:]), dim=1),
+        torch.cat((v[:1, :2], v[:1, 5:]), dim=1),
+    )
+    expected_long = _sdpa_attn_func(q[1:], k[1:], v[1:])
+    torch.testing.assert_close(actual, torch.cat((expected_short, expected_long)))
+
+
 @pytest.mark.parametrize("cfg_scale", [1.0, 4.0])
 @pytest.mark.parametrize("expand_query_mask", [False, True])
 @torch.no_grad()
@@ -467,7 +490,12 @@ def test_sensenova_u1_prefix_and_denoise_attention_match_singletons(
             prefix, indexes, create_block_causal_mask(positions, valid), cache
         )
         prefix_keys = cache.layers[0].keys.clone()
-        prepare_flash_kv_cache(cache, current_len=3, batch_size=batch_size)
+        prepare_flash_kv_cache(
+            cache,
+            current_len=3,
+            batch_size=batch_size,
+            prefix_lengths=torch.tensor(lengths),
+        )
         image_indexes = NEOChatModel._build_t2i_image_indexes(
             helper, 1, 3, torch.tensor(lengths), torch.device("cpu")
         )

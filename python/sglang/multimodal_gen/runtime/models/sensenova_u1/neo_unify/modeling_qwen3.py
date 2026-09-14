@@ -220,6 +220,60 @@ def _flash_or_sdpa(
         return out.transpose(1, 2).contiguous()
     if input_layout != "BSND":
         raise RuntimeError("BNSD attention input requires the NPU FIA path")
+    if actual_seq_lengths_kv is not None:
+        batch_size, query_length = q.shape[:2]
+        padded_key_length = k.shape[1]
+        prefix_width = padded_key_length - query_length
+        if len(actual_seq_lengths_kv) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} KV lengths, got {len(actual_seq_lengths_kv)}"
+            )
+        if all(length == padded_key_length for length in actual_seq_lengths_kv):
+            return _flash_or_sdpa(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )
+        outputs = []
+        for batch_index, total_length in enumerate(actual_seq_lengths_kv):
+            prefix_length = total_length - query_length
+            if prefix_length < 0 or prefix_length > prefix_width:
+                raise ValueError(
+                    f"KV length {total_length} is incompatible with query length "
+                    f"{query_length} and padded key length {padded_key_length}"
+                )
+            if total_length == padded_key_length:
+                compact_k = k[batch_index : batch_index + 1]
+                compact_v = v[batch_index : batch_index + 1]
+            else:
+                compact_k = torch.cat(
+                    (
+                        k[batch_index : batch_index + 1, :prefix_length],
+                        k[batch_index : batch_index + 1, prefix_width:],
+                    ),
+                    dim=1,
+                )
+                compact_v = torch.cat(
+                    (
+                        v[batch_index : batch_index + 1, :prefix_length],
+                        v[batch_index : batch_index + 1, prefix_width:],
+                    ),
+                    dim=1,
+                )
+            outputs.append(
+                _flash_or_sdpa(
+                    q[batch_index : batch_index + 1],
+                    compact_k,
+                    compact_v,
+                    dropout_p=dropout_p,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                )
+            )
+        return torch.cat(outputs, dim=0)
     return _sdpa_attn_func(
         q,
         k,

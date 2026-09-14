@@ -52,7 +52,12 @@ def check_attention(cfg_scale, expand_query_mask):
             prefix, indexes, create_block_causal_mask(positions, valid), cache
         )
         prefix_keys = cache.layers[0].keys.clone()
-        prepare_flash_kv_cache(cache, current_len=3, batch_size=batch_size)
+        prepare_flash_kv_cache(
+            cache,
+            current_len=3,
+            batch_size=batch_size,
+            prefix_lengths=torch.tensor(lengths),
+        )
         image_indexes = NEOChatModel._build_t2i_image_indexes(
             helper, 1, 3, torch.tensor(lengths), torch.device("cuda")
         )
