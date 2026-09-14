@@ -14,6 +14,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
@@ -2411,6 +2412,10 @@ class NEOChatModel(PreTrainedModel):
                 z, self.patch_size * merge_size, image_size[1], image_size[0]
             )
 
+            profiler = SGLDiffusionProfiler.get_instance()
+            if profiler:
+                profiler.step_denoising_step()
+
         clear_flash_kv_cache(past_key_values_condition)
         if past_key_values_img_condition is not None:
             clear_flash_kv_cache(past_key_values_img_condition)
@@ -2786,6 +2791,10 @@ class NEOChatModel(PreTrainedModel):
             image_prediction = self.unpatchify(
                 z, self.patch_size * merge_size, image_size[1], image_size[0]
             )
+
+            profiler = SGLDiffusionProfiler.get_instance()
+            if profiler:
+                profiler.step_denoising_step()
 
         clear_flash_kv_cache(past_key_values_condition)
         if past_key_values_uncondition is not None:

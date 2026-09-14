@@ -19,6 +19,8 @@ export REPO=/workspace/sglang-cuda-batching
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
 export MODEL_PATH=/model/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
 export PROFILE_ROOT=/workspace/sensenova-gpu-profile-baseline
+export SGLANG_DIFFUSION_TORCH_PROFILER_RECORD_SHAPES=0
+export SGLANG_DIFFUSION_TORCH_PROFILER_WITH_STACK=0
 rm -rf "$PROFILE_ROOT"
 mkdir -p "$PROFILE_ROOT"
 cd "$REPO"

@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
+    SGLANG_DIFFUSION_TORCH_PROFILER_RECORD_SHAPES: bool = True
+    SGLANG_DIFFUSION_TORCH_PROFILER_WITH_STACK: bool = True
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -255,6 +257,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # traces are saved. Note that it must be an absolute path.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
+    ),
+    "SGLANG_DIFFUSION_TORCH_PROFILER_RECORD_SHAPES": _lazy_bool(
+        "SGLANG_DIFFUSION_TORCH_PROFILER_RECORD_SHAPES", "true"
+    ),
+    "SGLANG_DIFFUSION_TORCH_PROFILER_WITH_STACK": _lazy_bool(
+        "SGLANG_DIFFUSION_TORCH_PROFILER_WITH_STACK", "true"
     ),
     # If set, sgl_diffusion will run in development mode, which will enable
     # some additional endpoints for developing and debugging,

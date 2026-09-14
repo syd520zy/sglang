@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
@@ -92,8 +93,8 @@ class SGLDiffusionProfiler:
 
         common_torch_profiler_args = dict(
             activities=activities,
-            record_shapes=True,
-            with_stack=True,
+            record_shapes=envs.SGLANG_DIFFUSION_TORCH_PROFILER_RECORD_SHAPES,
+            with_stack=envs.SGLANG_DIFFUSION_TORCH_PROFILER_WITH_STACK,
             on_trace_ready=(
                 None
                 if not current_platform.is_npu()
@@ -115,7 +116,7 @@ class SGLDiffusionProfiler:
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
-                    active=self.num_active_steps,
+                    active=num_actual_steps,
                     repeat=1,
                 ),
             )
