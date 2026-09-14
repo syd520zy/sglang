@@ -664,7 +664,10 @@ def test_sensenova_u1_scheduler_capabilities(monkeypatch):
     monkeypatch.setattr(current_platform, "is_npu", lambda: True)
     assert config.supports_dynamic_batching()
     monkeypatch.setattr(current_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
     assert not config.supports_dynamic_batching()
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    assert config.supports_dynamic_batching()
     assert config.supports_sequential_multi_output_inference()
 
 

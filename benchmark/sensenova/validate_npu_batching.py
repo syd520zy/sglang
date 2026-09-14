@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--cfg", type=float, default=4.0)
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--save-images", action="store_true")
+    parser.add_argument("--device", choices=["npu", "cuda"], default="npu")
     args = parser.parse_args()
     if (
         min(args.requests, args.concurrency, args.size, args.steps) < 1
@@ -59,7 +60,7 @@ def main():
             guidance_scale=args.cfg,
             response_format="b64_json",
             output_format="png",
-            generator_device="npu",
+            generator_device=args.device,
         )
         start = time.perf_counter()
         try:

@@ -72,7 +72,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 "SenseNova-U1 expects output expansion before generation; "
                 f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
             )
-        if current_platform.is_npu():
+        if current_platform.is_npu() or current_platform.is_cuda():
             prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
             batch_size = len(prompts)
             if batch_size == 0:
@@ -109,7 +109,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         else:
             if isinstance(batch.prompt, list):
                 raise ValueError(
-                    "SenseNova-U1 dynamic batching is only supported on Ascend NPU"
+                    "SenseNova-U1 dynamic batching is only supported on Ascend NPU or CUDA"
                 )
             batch_size = 1
             seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)

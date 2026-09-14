@@ -85,7 +85,7 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     supports_cfg_parallel: bool = False
 
     def supports_dynamic_batching(self):
-        return current_platform.is_npu()
+        return current_platform.is_npu() or current_platform.is_cuda()
 
     def estimate_request_cost(self, batch) -> float:
         image_tokens = (int(batch.width) // RESOLUTION_ALIGNMENT) * (

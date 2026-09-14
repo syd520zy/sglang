@@ -2458,9 +2458,9 @@ class NEOChatModel(PreTrainedModel):
             raise ValueError(
                 "batched SenseNova-U1 generation does not support think_mode"
             )
-        if len(prompts) > 1 and self.device.type != "npu":
+        if len(prompts) > 1 and self.device.type not in ("npu", "cuda"):
             raise ValueError(
-                "batched SenseNova-U1 generation is only supported on Ascend NPU"
+                "batched SenseNova-U1 generation is only supported on Ascend NPU or CUDA"
             )
         self._notify_layer_offload_phase("prefix")
         merge_size = int(1 / self.downsample_ratio)
@@ -2648,7 +2648,7 @@ class NEOChatModel(PreTrainedModel):
         )
 
         attention_mask_condition = {"full_attention": None}
-        if device.type == "npu" and batch_size > 1:
+        if device.type in ("npu", "cuda") and batch_size > 1:
             condition_key_valid_mask = condition_key_valid_mask.expand(batch_size, -1)
             image_key_valid_mask = torch.ones(
                 (batch_size, token_h * token_w),
@@ -2658,7 +2658,7 @@ class NEOChatModel(PreTrainedModel):
             denoise_key_valid_mask = torch.cat(
                 [condition_key_valid_mask, image_key_valid_mask], dim=1
             )
-            if not envs.SGLANG_SENSENOVA_NPU_FIA:
+            if device.type != "npu" or not envs.SGLANG_SENSENOVA_NPU_FIA:
                 attention_mask_condition["full_attention"] = denoise_key_valid_mask[
                     :, None, None, :
                 ]
