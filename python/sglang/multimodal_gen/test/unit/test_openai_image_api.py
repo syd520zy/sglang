@@ -1,7 +1,11 @@
+import asyncio
 import inspect
 import os
 from dataclasses import fields
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi import HTTPException
 from PIL import Image
 
@@ -25,6 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _select_image_variant_cloud_url,
     _select_image_variant_path,
     edits,
+    generations,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
@@ -34,6 +39,54 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 def test_image_edits_declares_perf_dump_path_form_field():
     assert "perf_dump_path" in inspect.signature(edits).parameters
+
+
+def test_image_generations_forwards_profiling_options():
+    request = ImageGenerationsRequest(
+        prompt="profile this request",
+        profile=True,
+        num_profiled_timesteps=1,
+        profile_all_stages=False,
+    )
+    captured = {}
+
+    def build_sampling_params(_request_id, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "get_global_server_args",
+            return_value=SimpleNamespace(output_path=None),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "resolve_sampling_params_cls",
+            return_value=SamplingParams,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "build_sampling_params",
+            side_effect=build_sampling_params,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "prepare_request",
+            return_value=SimpleNamespace(extra={}),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "process_generation_batch",
+            new=AsyncMock(side_effect=RuntimeError("stop after parameter mapping")),
+        ),
+        pytest.raises(RuntimeError, match="stop after parameter mapping"),
+    ):
+        asyncio.run(generations(request, SimpleNamespace(headers={})))
+
+    assert captured["profile"] is True
+    assert captured["num_profiled_timesteps"] == 1
+    assert captured["profile_all_stages"] is False
 
 
 def test_url_response_returns_one_item_per_output_path():

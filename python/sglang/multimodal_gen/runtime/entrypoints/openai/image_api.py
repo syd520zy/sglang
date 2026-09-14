@@ -318,6 +318,9 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
+            profile=request.profile,
+            num_profiled_timesteps=request.num_profiled_timesteps,
+            profile_all_stages=request.profile_all_stages,
             progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
             progressive_levels=_get_request_field_or_extra(
                 request, "progressive_levels"
