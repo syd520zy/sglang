@@ -41,6 +41,14 @@ def test_image_edits_declares_perf_dump_path_form_field():
     assert "perf_dump_path" in inspect.signature(edits).parameters
 
 
+def test_image_generations_profiling_defaults():
+    request = ImageGenerationsRequest(prompt="ordinary request")
+
+    assert request.profile is False
+    assert request.num_profiled_timesteps is None
+    assert request.profile_all_stages is False
+
+
 def test_image_generations_forwards_profiling_options():
     request = ImageGenerationsRequest(
         prompt="profile this request",
