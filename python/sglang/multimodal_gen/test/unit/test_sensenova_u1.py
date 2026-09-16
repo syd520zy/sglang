@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
     _copy_right_aligned_prefix_bnsd,
+    _merge_cfg_kv_caches,
     _randn_with_seed,
     prepare_flash_kv_cache,
 )
@@ -368,6 +369,41 @@ def test_sensenova_u1_right_aligns_bnsd_prefix_for_npu_fia():
         [3, 4, 5, 6, 7],
     ]
     assert destination[:, :, 5:].eq(0).all()
+
+
+def test_sensenova_u1_merges_cfg_kv_caches_in_branch_order():
+    condition_cache = DynamicCache()
+    uncondition_cache = DynamicCache()
+    condition_keys = torch.tensor([[[[1], [2], [3]]], [[[4], [5], [6]]]])
+    condition_values = condition_keys + 10
+    uncondition_keys = torch.tensor([[[[7], [8]]], [[[9], [10]]]])
+    uncondition_values = uncondition_keys + 10
+    condition_cache.update(condition_keys, condition_values, layer_idx=0)
+    uncondition_cache.update(uncondition_keys, uncondition_values, layer_idx=0)
+
+    merged = _merge_cfg_kv_caches(condition_cache, uncondition_cache)
+
+    assert merged is uncondition_cache
+    assert merged.layers[0].keys[:, 0, :, 0].tolist() == [
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 0],
+        [9, 10, 0],
+    ]
+    assert merged.layers[0].values[:, 0, :, 0].tolist() == [
+        [11, 12, 13],
+        [14, 15, 16],
+        [17, 18, 0],
+        [19, 20, 0],
+    ]
+    prepare_flash_kv_cache(
+        merged,
+        current_len=4,
+        batch_size=4,
+        prefix_lengths=torch.tensor([3, 3, 2, 2]),
+    )
+    assert merged.layers[0].flash_k_cache.shape == (4, 7, 1, 1)
+    assert merged.layers[0].flash_actual_seq_lengths_kv == [7, 7, 6, 6]
 
 
 @pytest.mark.parametrize("available", [False, True])

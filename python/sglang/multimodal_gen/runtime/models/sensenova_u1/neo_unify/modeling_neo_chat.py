@@ -170,6 +170,42 @@ def clear_flash_kv_cache(past_key_values):
             delattr(layer, "flash_cache_layout")
 
 
+def _merge_cfg_kv_caches(condition_cache, uncondition_cache):
+    """Merge CFG branches, reusing the unconditional cache object."""
+    if len(condition_cache.layers) != len(uncondition_cache.layers):
+        raise ValueError("CFG caches must have the same number of layers")
+
+    for condition_layer, uncondition_layer in zip(
+        condition_cache.layers, uncondition_cache.layers
+    ):
+        for name in ("keys", "values"):
+            condition = getattr(condition_layer, name)
+            uncondition = getattr(uncondition_layer, name)
+            if condition is None or uncondition is None:
+                if condition is not None or uncondition is not None:
+                    raise ValueError(f"CFG cache {name} must exist in both branches")
+                continue
+            if (
+                condition.shape[:2] != uncondition.shape[:2]
+                or condition.shape[3:] != (uncondition.shape[3:])
+            ):
+                raise ValueError(
+                    f"CFG cache {name} shapes are incompatible: "
+                    f"{tuple(condition.shape)} and {tuple(uncondition.shape)}"
+                )
+
+            prefix_width = max(condition.shape[2], uncondition.shape[2])
+            merged_shape = list(condition.shape)
+            merged_shape[0] += uncondition.shape[0]
+            merged_shape[2] = prefix_width
+            merged = condition.new_zeros(merged_shape)
+            merged[: condition.shape[0], :, : condition.shape[2]].copy_(condition)
+            merged[condition.shape[0] :, :, : uncondition.shape[2]].copy_(uncondition)
+            setattr(uncondition_layer, name, merged)
+
+    return uncondition_cache
+
+
 def optimized_scale(positive_flat, negative_flat):
     # Force the divisor computation to float32 regardless of the surrounding
     # autocast (the squared-norm/division is what we don't want in fp16/bf16).
@@ -2590,14 +2626,47 @@ class NEOChatModel(PreTrainedModel):
                     *past_key_values_uncondition.layers[layer_idx].values.shape[1:],
                 )
 
-        # prepare flash cache once
         prepare_flash_kv_cache(
             past_key_values_condition,
             current_len=token_h * token_w,
             batch_size=batch_size,
             prefix_lengths=condition_prefix_lengths,
         )
-        if past_key_values_uncondition is not None:
+
+        past_key_values_cfg = indexes_image_cfg = None
+        if (
+            device.type == "cuda"
+            and not think_mode
+            and past_key_values_uncondition is not None
+        ):
+            past_key_values_cfg = _merge_cfg_kv_caches(
+                past_key_values_condition, past_key_values_uncondition
+            )
+            condition_indexes = (
+                indexes_image_condition.unsqueeze(0)
+                if indexes_image_condition.ndim == 2
+                else indexes_image_condition
+            ).expand(batch_size, -1, -1)
+            uncondition_indexes = (
+                indexes_image_uncondition.unsqueeze(0)
+                if indexes_image_uncondition.ndim == 2
+                else indexes_image_uncondition
+            ).expand(batch_size, -1, -1)
+            indexes_image_cfg = torch.cat(
+                [condition_indexes, uncondition_indexes], dim=0
+            )
+            prepare_flash_kv_cache(
+                past_key_values_cfg,
+                current_len=token_h * token_w,
+                batch_size=2 * batch_size,
+                prefix_lengths=torch.cat(
+                    [
+                        condition_prefix_lengths.reshape(-1).expand(batch_size),
+                        uncondition_prefix_lengths.reshape(-1).expand(batch_size),
+                    ]
+                ),
+            )
+        elif past_key_values_uncondition is not None:
             prepare_flash_kv_cache(
                 past_key_values_uncondition,
                 current_len=token_h * token_w,
@@ -2689,30 +2758,48 @@ class NEOChatModel(PreTrainedModel):
                     ).view(batch_size, token_h * token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred_condition = self._t2i_predict_v(
-                image_embeds,
-                indexes_image_condition,
-                attention_mask_condition,
-                past_key_values_condition,
-                t,
-                z,
-                image_token_num=token_h * token_w,
-                timestep_embeddings=timestep_embeddings,
-                image_size=image_size,
-            )
-
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
-                v_pred_uncondition = self._t2i_predict_v(
+            use_cfg = t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1
+            if use_cfg and past_key_values_cfg is not None:
+                cfg_predictions = self._t2i_predict_v(
+                    torch.cat([image_embeds, image_embeds], dim=0),
+                    indexes_image_cfg,
+                    {"full_attention": None},
+                    past_key_values_cfg,
+                    t,
+                    torch.cat([z, z], dim=0),
+                    image_token_num=token_h * token_w,
+                    timestep_embeddings=torch.cat(
+                        [timestep_embeddings, timestep_embeddings], dim=0
+                    ),
+                    image_size=image_size,
+                )
+                v_pred_condition, v_pred_uncondition = cfg_predictions.chunk(2)
+            else:
+                v_pred_condition = self._t2i_predict_v(
                     image_embeds,
-                    indexes_image_uncondition,
-                    attention_mask_uncondition,
-                    past_key_values_uncondition,
+                    indexes_image_condition,
+                    attention_mask_condition,
+                    past_key_values_condition,
                     t,
                     z,
                     image_token_num=token_h * token_w,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
+
+            if use_cfg:
+                if past_key_values_cfg is None:
+                    v_pred_uncondition = self._t2i_predict_v(
+                        image_embeds,
+                        indexes_image_uncondition,
+                        attention_mask_uncondition,
+                        past_key_values_uncondition,
+                        t,
+                        z,
+                        image_token_num=token_h * token_w,
+                        timestep_embeddings=timestep_embeddings,
+                        image_size=image_size,
+                    )
                 if cfg_norm == "cfg_zero_star":
                     positive_flat = v_pred_condition.view(batch_size, -1)
                     negative_flat = v_pred_uncondition.view(batch_size, -1)
