@@ -29,6 +29,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
+from sglang.multimodal_gen.runtime.layers.kvcache.sensenova import Int8DenoisingCache
+
 from .transformers_compat import (
     causal_mask_kwargs,
     model_input_compat,
@@ -728,6 +730,17 @@ class Qwen3Attention(nn.Module):
         key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
 
         update_cache = kwargs.get("update_cache", True)
+
+        if isinstance(past_key_values, Int8DenoisingCache):
+            if update_cache or self.training or attention_mask is not None:
+                raise ValueError(
+                    "INT8 KV supports only unmasked, inference-only denoising"
+                )
+            attn_output = past_key_values.attention(
+                self.layer_idx, query_states, key_states, value_states, self.scaling
+            )
+            attn_output = attn_output.reshape(*input_shape, -1)
+            return self.o_proj_mot_gen(attn_output), None
 
         # ------------------------------------------------------------------
         # Flash path:

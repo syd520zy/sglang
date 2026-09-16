@@ -64,7 +64,11 @@ class SenseNovaU1GenerationStage(PipelineStage):
         return RoleType.DENOISER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        del server_args
+        kv_cache_dtype = getattr(
+            getattr(server_args, "pipeline_config", None),
+            "sensenova_kv_cache_dtype",
+            "auto",
+        )
         options = SenseNovaU1GenerationOptions.from_batch(batch)
         if int(batch.num_outputs_per_prompt) != 1:
             raise ValueError(
@@ -87,6 +91,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             t_eps=options.t_eps,
             think_mode=options.think_mode,
             seed=seed,
+            kv_cache_dtype=kv_cache_dtype,
         )
         think_text = None
         if options.think_mode:

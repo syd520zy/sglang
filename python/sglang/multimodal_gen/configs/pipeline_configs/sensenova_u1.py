@@ -79,6 +79,7 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     model_precision: str = "bf16"
     should_use_guidance: bool = True
     supports_cfg_parallel: bool = False
+    sensenova_kv_cache_dtype: str = "auto"
 
     def supports_dynamic_batching(self):
         return False
@@ -90,6 +91,8 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         return True
 
     def validate_server_args(self, server_args) -> None:
+        if self.sensenova_kv_cache_dtype not in ("auto", "int8"):
+            raise ValueError("sensenova_kv_cache_dtype must be 'auto' or 'int8'")
         if server_args.num_gpus != 1:
             raise ValueError(
                 "SenseNovaU1Pipeline currently supports num_gpus=1. "

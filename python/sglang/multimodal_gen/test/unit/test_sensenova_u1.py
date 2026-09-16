@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
     get_conv_template,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+    NEOChatModel,
     _randn_with_seed,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -581,7 +582,10 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert "think_mode" not in cli_args
 
 
-def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "int8"])
+def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch(
+    kv_cache_dtype,
+):
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
@@ -604,7 +608,14 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     model = _FakeSenseNovaModel()
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
 
-    output = stage.forward(batch, server_args=SimpleNamespace())
+    output = stage.forward(
+        batch,
+        server_args=SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(
+                sensenova_kv_cache_dtype=kv_cache_dtype
+            )
+        ),
+    )
 
     assert len(output.output) == 1
     assert torch.allclose(
@@ -624,6 +635,123 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+    assert model.call_kwargs["kv_cache_dtype"] == kv_cache_dtype
+
+
+def test_sensenova_u1_rejects_unknown_kv_cache_dtype():
+    config = SenseNovaU1PipelineConfig(sensenova_kv_cache_dtype="fp8")
+    with pytest.raises(ValueError, match="sensenova_kv_cache_dtype"):
+        config.validate_server_args(SimpleNamespace(num_gpus=1))
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "int8"])
+@pytest.mark.parametrize("cfg_scale", [1, 4])
+@pytest.mark.parametrize("think_mode", [False, True])
+def test_sensenova_u1_t2i_cache_transition(
+    monkeypatch, kv_cache_dtype, cfg_scale, think_mode
+):
+    from sglang.multimodal_gen.runtime.layers.kvcache.sensenova import (
+        Int8DenoisingCache,
+    )
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+        modeling_neo_chat,
+    )
+
+    # Exercise the real T2I orchestration without loading weights or a GPU.
+    monkeypatch.setattr(
+        modeling_neo_chat, "validate_int8_kv_device", lambda *args: None
+    )
+    sources, calls = [], []
+
+    def prefix_forward(input_ids, *args, **kwargs):
+        length = input_ids.shape[1]
+        keys = torch.arange(length * 64, dtype=torch.float16).reshape(1, 1, length, 64)
+        cache = SimpleNamespace(layers=[SimpleNamespace(keys=keys, values=keys + 1)])
+        sources.append(cache)
+        return cache, torch.zeros(1, length, 4, dtype=torch.float16)
+
+    def think_prefix(**kwargs):
+        cache, hidden = prefix_forward(kwargs["input_ids"])
+        return SimpleNamespace(past_key_values=cache, logits=hidden)
+
+    def generate_think(tokenizer, outputs, cache, t_index, img_start):
+        # Think finishes in the original dtype and extends the prefix before INT8.
+        layer = cache.layers[0]
+        assert layer.keys.dtype == torch.float16
+        layer.keys = torch.cat((layer.keys, layer.keys[:, :, :1]), dim=2)
+        layer.values = torch.cat((layer.values, layer.values[:, :, :1]), dim=2)
+        return cache, t_index + 1, "thought"
+
+    def text_inputs(tokenizer, query):
+        length = 3 if query else 1
+        return torch.zeros(1, length, dtype=torch.long), torch.zeros(3, length), None
+
+    def predict(embeds, indexes, mask, cache, t, z, **kwargs):
+        calls.append(cache)
+        assert mask == {"full_attention": None}
+        assert isinstance(cache, Int8DenoisingCache) == (kv_cache_dtype == "int8")
+        if kv_cache_dtype == "int8":
+            assert not hasattr(cache.layers[0], "flash_k_cache")
+        else:
+            assert cache.layers[0].flash_k_cache.shape[0] == 2
+        return torch.zeros_like(z)
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        concat_time_token_num=0,
+        downsample_ratio=1,
+        patch_size=2,
+        config=SimpleNamespace(),
+        noise_scale=1,
+        noise_scale_mode="fixed",
+        noise_scale_max_value=1,
+        add_noise_scale_embedding=False,
+        _notify_layer_offload_phase=lambda phase: None,
+        _build_t2i_query=lambda prompt, **kwargs: prompt,
+        _build_t2i_text_inputs=text_inputs,
+        _build_t2i_image_indexes=lambda *args, **kwargs: torch.zeros(3, 1),
+        _t2i_prefix_forward=prefix_forward,
+        _think_prefix_forward=think_prefix,
+        _generate_think=generate_think,
+        patchify=lambda x, *args, **kwargs: torch.zeros(2, 1, 12, dtype=x.dtype),
+        extract_feature=lambda x, **kwargs: torch.zeros(2, 4, dtype=x.dtype),
+        fm_modules={
+            "timestep_embedder": lambda t: torch.zeros(
+                t.numel(), 4, dtype=torch.float16
+            )
+        },
+        _t2i_predict_v=predict,
+        unpatchify=lambda z, *args: torch.zeros(2, 3, 2, 2, dtype=z.dtype),
+    )
+    result = NEOChatModel.t2i_generate(
+        model,
+        None,
+        "prompt",
+        image_size=(2, 2),
+        num_steps=2,
+        batch_size=2,
+        cfg_scale=cfg_scale,
+        think_mode=think_mode,
+        enable_timestep_shift=False,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    images = result[0] if think_mode else result
+    assert images.shape == (2, 3, 2, 2)
+    assert len(calls) == (4 if cfg_scale > 1 else 2)
+    assert calls[0] is calls[-2 if cfg_scale > 1 else -1]
+    if think_mode:
+        assert result[1] == "thought"
+    if kv_cache_dtype == "int8":
+        assert calls[0].get_seq_length() == (4 if think_mode else 3)
+        assert calls[0].layers[0].keys.shape[0] == 1
+        if cfg_scale > 1:
+            assert calls[1] is not calls[0]
+            assert calls[1].get_seq_length() == 1
+        assert all(source.layers[0].keys is None for source in sources)
+    else:
+        assert all(source.layers[0].keys is not None for source in sources)
+        assert all(not hasattr(source.layers[0], "flash_k_cache") for source in sources)
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():

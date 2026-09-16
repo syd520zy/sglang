@@ -13,6 +13,11 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.multimodal_gen.runtime.layers.kvcache.sensenova import (
+    Int8DenoisingCache,
+    validate_int8_kv_device,
+)
+
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_fm_modules import (
@@ -2293,9 +2298,14 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        kv_cache_dtype="auto",
     ):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
+        if kv_cache_dtype not in ("auto", "int8"):
+            raise ValueError("kv_cache_dtype must be 'auto' or 'int8'")
+        if kv_cache_dtype == "int8":
+            validate_int8_kv_device(self.device, self.dtype)
         self._notify_layer_offload_phase("prefix")
         merge_size = int(1 / self.downsample_ratio)
 
@@ -2431,18 +2441,27 @@ class NEOChatModel(PreTrainedModel):
                     *past_key_values_uncondition.layers[layer_idx].values.shape[1:],
                 )
 
-        # prepare flash cache once
-        prepare_flash_kv_cache(
-            past_key_values_condition,
-            current_len=token_h * token_w,
-            batch_size=batch_size,
-        )
-        if past_key_values_uncondition is not None:
+        # INT8 consumes the prefix cache; it does not allocate image KV buffers.
+        if kv_cache_dtype == "int8":
+            past_key_values_condition = Int8DenoisingCache.from_cache(
+                past_key_values_condition
+            )
+            if past_key_values_uncondition is not None:
+                past_key_values_uncondition = Int8DenoisingCache.from_cache(
+                    past_key_values_uncondition
+                )
+        else:
             prepare_flash_kv_cache(
-                past_key_values_uncondition,
+                past_key_values_condition,
                 current_len=token_h * token_w,
                 batch_size=batch_size,
             )
+            if past_key_values_uncondition is not None:
+                prepare_flash_kv_cache(
+                    past_key_values_uncondition,
+                    current_len=token_h * token_w,
+                    batch_size=batch_size,
+                )
 
         # init noise image tokens
         grid_h = image_size[1] // self.patch_size
