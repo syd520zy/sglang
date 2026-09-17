@@ -4,8 +4,12 @@ from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
+import triton
 
-from sglang.kernels.ops.attention.sensenova_int8 import int8_prefix_attention
+from sglang.kernels.ops.attention.sensenova_int8 import (
+    _int8_prefix_attention,
+    int8_prefix_attention,
+)
 from sglang.multimodal_gen.runtime.layers.kvcache.sensenova import (
     Int8DenoisingCache,
     quantize_prefix,
@@ -17,6 +21,56 @@ register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestSenseNovaInt8Attention(CustomTestCase):
+    @torch.inference_mode()
+    def test_unquantized_prefix_specialization(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            for p in (0, 65):
+                with self.subTest(dtype=dtype, prefix=p):
+                    q = torch.randn(
+                        2, 71, 4, 128, device="cuda", dtype=dtype
+                    ).transpose(1, 2)
+                    k = torch.randn(
+                        2, 71, 2, 128, device="cuda", dtype=dtype
+                    ).transpose(1, 2)
+                    v = torch.randn_like(k)
+                    pk = torch.randn(1, 2, p, 128, device="cuda", dtype=dtype)
+                    pv = torch.randn_like(pk)
+                    ref = F.scaled_dot_product_attention(
+                        q.float(),
+                        torch.cat((pk.expand(2, -1, -1, -1), k), 2).float(),
+                        torch.cat((pv.expand(2, -1, -1, -1), v), 2).float(),
+                        enable_gqa=True,
+                    ).transpose(1, 2)
+                    out = torch.empty((2, 71, 4, 128), device="cuda", dtype=dtype)
+                    # Scale pointers are unused in the full-precision specialization.
+                    _int8_prefix_attention[(triton.cdiv(71, 32), 4, 2)](
+                        q,
+                        k,
+                        v,
+                        pk,
+                        pv,
+                        pk,
+                        pv,
+                        out,
+                        q.stride(),
+                        k.stride(),
+                        v.stride(),
+                        4,
+                        2,
+                        71,
+                        p,
+                        128,
+                        True,
+                        True,
+                        128**-0.5,
+                        32,
+                        64,
+                        128,
+                        num_warps=4,
+                        num_stages=2,
+                    )
+                    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+
     @torch.inference_mode()
     def test_dense_and_moe_denoising_use_read_only_cache(self):
         from transformers.cache_utils import DynamicCache

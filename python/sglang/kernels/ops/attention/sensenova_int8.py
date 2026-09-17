@@ -72,16 +72,19 @@ def _int8_prefix_attention(
                     PK + ki[None, :] * D + dims[:, None],
                     (tokens[None, :] < P) & (dims[:, None] < D),
                     other=0,
-                ).to(tl.float32)
+                )
                 value = tl.load(
                     PV + vi[:, None] * D + dims[None, :],
                     (tokens[:, None] < P) & (dims[None, :] < D),
                     other=0,
-                ).to(tl.float32)
-                key_scale = tl.load(KS + ki, tokens < P, other=0)
-                value_scale = tl.load(VS + vi, tokens < P, other=0)
-                key = (key * key_scale[None, :]).to(q.dtype)
-                value = (value * value_scale[:, None]).to(q.dtype)
+                )
+                # Full-precision specialization is used only by the benchmark
+                # to separate storage-layout savings from quantization costs.
+                if PK.dtype.element_ty == tl.int8:
+                    key_scale = tl.load(KS + ki, tokens < P, other=0)
+                    value_scale = tl.load(VS + vi, tokens < P, other=0)
+                    key = (key.to(tl.float32) * key_scale[None, :]).to(q.dtype)
+                    value = (value.to(tl.float32) * value_scale[:, None]).to(q.dtype)
             else:
                 key = tl.load(
                     K

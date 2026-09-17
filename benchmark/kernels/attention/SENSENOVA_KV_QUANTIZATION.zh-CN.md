@@ -30,7 +30,7 @@ git log -1 --oneline
 
 本分支基于 main 的 `faaff1eca8876b8b77d8704f080c3ee2064b8b65` 开发。后续更新时，在工作区没有未提交修改的情况下运行 `git pull --ff-only`。
 
-上述命令仅获取源码。运行前仍需按仓库安装说明配置 SGLang、PyTorch、Triton、FlashAttention 和测试依赖。完整模型验证另需模型权重；算子测试和微基准不需要权重。
+上述命令仅获取源码。运行前仍需按仓库安装说明配置 SGLang、PyTorch、Triton 和测试依赖（SDPA 微基准不需要 FA3）。完整模型验证另需模型权重；算子测试和微基准不需要权重。
 
 ## 启用方法
 
@@ -65,7 +65,7 @@ python benchmark/kernels/attention/bench_sensenova_int8.py --batch-size 1 --pref
 python benchmark/kernels/attention/bench_sensenova_int8.py --batch-size 1 --prefix-length 256 --image-tokens 1024 --dtype fp16 > sensenova-int8-fp16.json
 ```
 
-后续扩展到 batch size 1/2/4、前缀长度 256/1024/4096、实际分辨率对应的图像 token 数。用 `--query-heads`、`--kv-heads`、`--head-dim` 指定真实模型参数，默认值只是合成配置。默认 `--baseline flash` 包含原路径的布局转换和拷贝；只有实际部署使用 SDPA 时才改为 `--baseline sdpa`。
+后续扩展到 batch size 1/2/4、前缀长度 256/1024/4096、实际分辨率对应的图像 token 数。用 `--query-heads`、`--kv-heads`、`--head-dim` 指定真实模型参数，默认值只是合成配置。默认 `--baseline sdpa` 复现模型显式重复 GQA heads 的计算方式，包含布局转换、拷贝和输出 contiguous。每次同时报告原生 GQA SDPA 和未量化分离 KV 对照。可用 `--baseline sdpa-gqa` 选择原生 GQA 为主对照；可选 flash 需要 flash_attn_func，不自动切换 FA3。新版原生 GQA 对照包含输出 contiguous，与旧 JSON 并非完全同口径。
 
 | JSON 字段 | 含义 |
 | --- | --- |
@@ -89,4 +89,22 @@ python benchmark/kernels/attention/bench_sensenova_int8.py --batch-size 1 --pref
 - FP16 Triton 解释器通过空前缀、非整块长度、GQA 和共享 batch；小型 Dense、MoE 各两步去噪输出在容差内。这是 CPU 解释器验证，不是真实 GPU 执行。当前版本的 BF16 解释器 dot 不能替代硬件数值验证。
 - SM80/SM89 的 FP16/BF16 离线 CUDA 编译通过，包括 head dimension 256。
 - 8 组独立 CPU 流程测试覆盖 `auto`/`int8`、CFG 开关、Think 开关；真实 T2I 方法配合模拟模型组件，检查 Think 后转换、CFG 前缀独立、多步复用和原路径清理。
-- RTX 4090 实机执行、BF16 GPU 数值一致性、完整模型画质、端到端吞吐仍未验证。功能默认关闭，暂不宣称性能收益。
+- 原版 RTX 4090 测试已通过：缓存 5 passed、算子 4 passed、模型 63 passed，包括 BF16 数值验证。本轮新增对照仍需实机验证，完整模型画质、端到端吞吐尚未验证。
+
+
+## 第二阶段：对照与分块扫描
+
+```bash
+python benchmark/kernels/attention/bench_sensenova_int8.py --dtype bf16 --sweep-kernel > sensenova-int8-bf16-v2.json
+python benchmark/kernels/attention/bench_sensenova_int8.py --dtype fp16 --sweep-kernel > sensenova-int8-fp16-v2.json
+```
+
+- `model_sdpa_attention_ms`：模型显式重复 KV heads 的 SDPA 路径。
+- `native_gqa_attention_ms`：原生 GQA SDPA 路径。
+- `unquantized_separated_attention_ms`：同一个 Triton 算子读取 FP16/BF16 前缀，不拼接 KV、不读 scale；仅用于 benchmark，未接入模型。
+- `unquantized_separated_cache_bytes_per_layer`：原始共享前缀字节数，无额外准备分配。
+- `kernel_sweep`：四组分块分别测未量化和 INT8，先检查相对 L2 误差不超过 0.025 再计时。资源不足记录 unsupported，其他异常直接报错。扫描不修改生产默认分块。
+
+缓存字节数不含 attention 临时张量、输出和 allocator 开销。分离 KV 对照与 SDPA 同时改变了算子，时间差不能全部归因于取消拷贝；分离 KV 与 INT8 使用相同分块，适合分析量化代价。
+
+首次 RTX 4090 结果（旧版原生 GQA SDPA）：BF16 基线/INT8 为 0.1766/0.2184 ms，FP16 为 0.1770/0.2155 ms，尚无吞吐收益证据。先复测默认尺寸，再扩展 batch 1/2/4、prefix 256/1024/4096 和实际图像 token 数。微基准不替代端到端图片/秒。
