@@ -158,3 +158,16 @@ python benchmark/kernels/attention/bench_sensenova_int8.py --quantize-image --re
 
 
 图像实验本地验证：SM80/SM89、FP16/BF16、head dimension 128/256 的融合量化与 attention 离线编译通过；旧前缀分支离线编译及 FP16 解释器回归通过。图像 attention 的 FP16 解释器验证使用独立的高精度量化参考提供 INT8 输入，空前缀和非整块长度在容差内。本地解释器不能执行 libdevice 舍入函数，融合量化数值与 BF16 执行仍需新增 GPU 单测确认。以上均不是 4090 性能或端到端验证。
+
+
+## 图像 KV profiling
+
+```bash
+bash benchmark/kernels/attention/run_sensenova_image_int8_profile.sh
+```
+
+覆盖 1024/2048、batch 1/2、FP16/BF16，共 8 组。先运行单测和不带 profiler 的七轮基准，再对六条路径分别预热 20 次、采集 10 次调用。每条路径保存 Chrome trace、算子表和设备 kernel 汇总（微秒）。若没有采集到 CUDA kernel 事件，脚本报错并保留 trace，避免将 CPU-only 结果误当 GPU profile。
+
+trace 中 `sensenova/<路径名>` 标识 CPU 调用范围，CUDA 时间线展示相应 kernel。`kernels.json` 汇总名称、调用数、总耗时和均值，`operators.txt` 提供 CPU/CUDA 算子归因。性能对比继续使用未开启 profiler 的 `timings`，采集过程开启 shape/memory 会引入开销。
+
+该采集用于定位具体 SDPA 后端、量化 kernel、拷贝和 attention 的耗时；不能直接测量寄存器占用率、DRAM 吞吐或 warp stall。需要这些硬件计数器时，再针对 trace 中确认的 kernel 使用 Nsight Compute；不根据 PyTorch trace 单独断言计算或带宽瓶颈。当前实验仍不依赖 FA3。

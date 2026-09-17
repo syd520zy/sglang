@@ -7,6 +7,7 @@ import random
 import statistics
 import sys
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +54,51 @@ def measure_interleaved(functions, rounds):
     }
 
 
+def profile_image_paths(functions, output_dir, iterations):
+    """Capture warmed paths separately; profiler times are diagnostic only."""
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    for name, fn in functions.items():
+        for _ in range(20):
+            fn()
+        torch.cuda.synchronize()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+        ) as prof:
+            for _ in range(iterations):
+                with record_function("sensenova/" + name):
+                    fn()
+            torch.cuda.synchronize()
+        trace = output / f"{name}.trace.json"
+        prof.export_chrome_trace(str(trace))
+        (output / f"{name}.operators.txt").write_text(
+            prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50),
+            encoding="utf-8",
+        )
+        # Read actual device events so a CPU-only capture cannot look successful.
+        events = json.loads(trace.read_text(encoding="utf-8"))["traceEvents"]
+        kernels = {}
+        for event in events:
+            if event.get("cat") != "kernel" or "dur" not in event:
+                continue
+            entry = kernels.setdefault(event["name"], {"calls": 0, "total_us": 0.0})
+            entry["calls"] += 1
+            entry["total_us"] += event["dur"]
+        if not kernels:
+            raise RuntimeError(
+                f"No CUDA kernel events in {trace}; check CUPTI/profiler availability"
+            )
+        for entry in kernels.values():
+            entry["mean_us"] = entry["total_us"] / entry["calls"]
+        (output / f"{name}.kernels.json").write_text(
+            json.dumps(kernels, indent=2), encoding="utf-8"
+        )
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -72,11 +118,17 @@ def main():
         action="store_true",
         help="Measure experimental tile sizes; production defaults stay unchanged",
     )
+    parser.add_argument("--profile-dir")
+    parser.add_argument("--profile-iterations", type=int, default=10)
     parser.add_argument("--quantize-image", action="store_true")
     parser.add_argument("--resolution", type=int, choices=(512, 1024, 2048, 4096))
     parser.add_argument("--effective-patch-size", type=int, default=32)
     parser.add_argument("--rounds", type=int, default=7)
     args = parser.parse_args()
+    if args.profile_iterations <= 0:
+        parser.error("profile-iterations must be positive")
+    if args.profile_dir and not args.quantize_image:
+        parser.error("profile-dir requires --quantize-image")
     if args.effective_patch_size <= 0:
         parser.error("effective-patch-size must be positive")
     if args.resolution is not None:
@@ -210,6 +262,8 @@ def main():
         del ref, result
         functions["image_quantization"] = partial(quantize_image_kv, k, v)
         timings = measure_interleaved(functions, args.rounds)
+        if args.profile_dir:
+            profile_image_paths(functions, args.profile_dir, args.profile_iterations)
         # All comparison buffers remain resident. This measures only the
         # additional live allocations of each invocation, not model peak memory.
         extra_peak = {}
