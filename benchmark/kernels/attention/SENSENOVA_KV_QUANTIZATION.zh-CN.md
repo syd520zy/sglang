@@ -108,3 +108,21 @@ python benchmark/kernels/attention/bench_sensenova_int8.py --dtype fp16 --sweep-
 缓存字节数不含 attention 临时张量、输出和 allocator 开销。分离 KV 对照与 SDPA 同时改变了算子，时间差不能全部归因于取消拷贝；分离 KV 与 INT8 使用相同分块，适合分析量化代价。
 
 首次 RTX 4090 结果（旧版原生 GQA SDPA）：BF16 基线/INT8 为 0.1766/0.2184 ms，FP16 为 0.1770/0.2155 ms，尚无吞吐收益证据。先复测默认尺寸，再扩展 batch 1/2/4、prefix 256/1024/4096 和实际图像 token 数。微基准不替代端到端图片/秒。
+
+
+## 第三阶段：稳定计时和配置矩阵
+
+新版 JSON 的 `benchmark_version` 为 3。所有 attention 路径先编译、检查精度，并使用相同的预热过程；默认 `--rounds 7`，每轮用固定随机种子打乱测量顺序，每次计时使用 Triton `do_bench(warmup=100, rep=300, return_mode="median")`，时间参数单位为毫秒。缓存准备单独采用相同的多轮流程。此流程不能消除 GPU 频率、温度或其他任务的干扰。
+
+`timings` 与 `preparation_timings` 包含每轮中位耗时 `round_medians_ms`，以及这些值的中位数、最小值和最大值。范围描述轮间波动，不是置信区间或请求 P95。顶层耗时字段复用对应的中位数，不再额外计时；摊销加速比是这些中位数的组合，不是端到端测量。所有候选路径均在计时前检查有限输出与相对 L2 误差（上限 0.025），误差统一参照模型 SDPA。
+
+激活现有环境并更新代码后执行：
+
+```bash
+cd /workspace/sglang
+bash benchmark/kernels/attention/run_sensenova_int8_sweep.sh
+```
+
+可传入结果目录作为第一个参数。脚本先跑三个测试文件，再扫描两种精度 × batch 1/2/4 × prefix 256/1024/4096，共 18 组；每组扫描四个分块，图像 tokens 固定为 1024。默认 head 参数仍是合成配置，不代表所有模型。脚本不更新仓库、不安装依赖。
+
+每组输出 JSON 和 stderr，`status.csv` 记录退出码。测试失败立即停止；某组 benchmark 失败则保留日志并继续其他组，最终以非零状态退出。运行时尽量保持 GPU 无其他任务；完成后提供整个结果目录，重点比较原生 GQA、未量化分离 KV、INT8 在相同配置下的耗时和波动，再选择端到端验证路径。

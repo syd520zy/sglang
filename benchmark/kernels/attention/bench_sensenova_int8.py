@@ -3,7 +3,10 @@
 
 import argparse
 import json
+import random
+import statistics
 import sys
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +21,34 @@ from sglang.multimodal_gen.runtime.layers.kvcache.sensenova import (
     quantize_prefix,
     validate_int8_kv_device,
 )
+
+
+def measure_interleaved(functions, rounds):
+    """Compile/warm every path before timing; retain each round for paired analysis."""
+    for fn in functions.values():
+        triton.testing.do_bench(fn, warmup=100, rep=100, return_mode="median")
+    samples = {name: [] for name in functions}
+    rng = random.Random(42)
+    for _ in range(rounds):
+        order = list(functions)
+        rng.shuffle(order)
+        for name in order:
+            samples[name].append(
+                float(
+                    triton.testing.do_bench(
+                        functions[name], warmup=100, rep=300, return_mode="median"
+                    )
+                )
+            )
+    return {
+        name: {
+            "median_ms": statistics.median(values),
+            "min_ms": min(values),
+            "max_ms": max(values),
+            "round_medians_ms": values,
+        }
+        for name, values in samples.items()
+    }
 
 
 @torch.inference_mode()
@@ -39,6 +70,7 @@ def main():
         action="store_true",
         help="Measure experimental tile sizes; production defaults stay unchanged",
     )
+    parser.add_argument("--rounds", type=int, default=7)
     args = parser.parse_args()
     b, p, s, h, hk, d = (
         args.batch_size,
@@ -48,7 +80,7 @@ def main():
         args.kv_heads,
         args.head_dim,
     )
-    if min(b, s, h, hk, d, args.steps) <= 0 or p < 0 or h % hk or d > 256:
+    if min(b, s, h, hk, d, args.steps, args.rounds) <= 0 or p < 0 or h % hk or d > 256:
         parser.error("Invalid dimensions, GQA ratio, or step count")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     validate_int8_kv_device(torch.device("cuda"), dtype)
@@ -135,45 +167,70 @@ def main():
         )
         return out
 
-    ref = baseline().float()
-    torch.testing.assert_close(separated().float(), ref, atol=0.015, rtol=0.015)
-    native_gqa_ms = triton.testing.do_bench(lambda: baseline("sdpa-gqa"))
-    model_sdpa_ms = triton.testing.do_bench(lambda: baseline("sdpa"))
-    separated_ms = triton.testing.do_bench(separated)
+    ref = baseline("sdpa").float()
+    functions = {
+        "model_sdpa": partial(baseline, "sdpa"),
+        "native_gqa": partial(baseline, "sdpa-gqa"),
+        "unquantized_separated": separated,
+        "int8": quantized,
+    }
+    if args.baseline == "flash":
+        functions["flash"] = baseline
     sweep = []
     if args.sweep_kernel:
         for bm, bn, warps in ((32, 64, 4), (64, 32, 4), (64, 64, 4), (64, 64, 8)):
             row = {"block_m": bm, "block_n": bn, "num_warps": warps}
-            try:
-                for quant in (False, True):
-                    name = "int8" if quant else "unquantized"
-                    fn = lambda: separated(quant, bm, bn, warps)
-                    result = fn().float()
-                    relative_error = ((result - ref).norm() / ref.norm()).item()
-                    if not torch.isfinite(result).all() or relative_error > 0.025:
-                        raise AssertionError(
-                            f"{name} relative L2 error: {relative_error}"
-                        )
-                    row[name + "_relative_l2_error"] = relative_error
-                    row[name + "_attention_ms"] = triton.testing.do_bench(fn)
-            except triton.OutOfResources as exc:
-                row["unsupported"] = str(exc)
-                print(
-                    f"Skipping resource-limited configuration: {row}", file=sys.stderr
-                )
+            for quant in (False, True):
+                name = "int8" if quant else "unquantized"
+                key = f"{name}_{bm}_{bn}_{warps}"
+                fn = partial(separated, quant, bm, bn, warps)
+                try:
+                    fn()  # Compile before accepting a candidate for measurement.
+                    torch.cuda.synchronize()
+                except triton.OutOfResources as exc:
+                    row[name + "_unsupported"] = str(exc)
+                    print(f"Skipping {key}: {exc}", file=sys.stderr)
+                    continue
+                functions[key] = fn
+                row[name + "_measurement"] = key
             sweep.append(row)
-    error = ((quantized().float() - ref).norm() / ref.norm()).item()
-    baseline_ms = triton.testing.do_bench(baseline)
-    int8_ms = triton.testing.do_bench(quantized)
-    baseline_prepare_ms = triton.testing.do_bench(prepare_baseline)
-    int8_prepare_ms = triton.testing.do_bench(prepare_int8)
+    errors = {}
+    for name, fn in functions.items():
+        result = fn().float()
+        error = ((result - ref).norm() / ref.norm().clamp_min(1e-12)).item()
+        if not torch.isfinite(result).all() or not 0 <= error <= 0.025:
+            raise AssertionError(f"{name} relative L2 error: {error}")
+        errors[name] = error
+    del result, ref
+    timings = measure_interleaved(functions, args.rounds)
+    preparation = measure_interleaved(
+        {"baseline": prepare_baseline, "int8": prepare_int8}, args.rounds
+    )
+    for row in sweep:
+        for name in ("unquantized", "int8"):
+            key = row.get(name + "_measurement")
+            if key is not None:
+                row[name + "_relative_l2_error"] = errors[key]
+                row[name + "_attention_ms"] = timings[key]["median_ms"]
+    baseline_key = {"sdpa": "model_sdpa", "sdpa-gqa": "native_gqa", "flash": "flash"}[
+        args.baseline
+    ]
+    baseline_ms = timings[baseline_key]["median_ms"]
+    int8_ms = timings["int8"]["median_ms"]
+    baseline_prepare_ms = preparation["baseline"]["median_ms"]
+    int8_prepare_ms = preparation["int8"]["median_ms"]
     print(
         json.dumps(
             {
-                "benchmark_version": 2,
-                "model_sdpa_attention_ms": model_sdpa_ms,
-                "native_gqa_attention_ms": native_gqa_ms,
-                "unquantized_separated_attention_ms": separated_ms,
+                "benchmark_version": 3,
+                "timings": timings,
+                "preparation_timings": preparation,
+                "relative_l2_errors": errors,
+                "model_sdpa_attention_ms": timings["model_sdpa"]["median_ms"],
+                "native_gqa_attention_ms": timings["native_gqa"]["median_ms"],
+                "unquantized_separated_attention_ms": timings["unquantized_separated"][
+                    "median_ms"
+                ],
                 "unquantized_separated_cache_bytes_per_layer": pk.nbytes + pv.nbytes,
                 "kernel_sweep": sweep,
                 "device": torch.cuda.get_device_name(),
@@ -193,7 +250,7 @@ def main():
                     baseline_prepare_ms + args.steps * baseline_ms
                 )
                 / (int8_prepare_ms + args.steps * int8_ms),
-                "relative_l2_error": error,
+                "relative_l2_error": errors["int8"],
             },
             indent=2,
         )
