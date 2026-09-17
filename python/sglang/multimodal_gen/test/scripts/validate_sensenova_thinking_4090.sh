@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SENSENOVA_REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
+cd "${SENSENOVA_REPO_ROOT}"
+export PYTHONPATH="${SENSENOVA_REPO_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
+
 MODEL_PATH="${MODEL_PATH:-sensenova/SenseNova-U1.5-8B-MoT}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-30000}"
