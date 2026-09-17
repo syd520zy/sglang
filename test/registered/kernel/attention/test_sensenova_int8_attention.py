@@ -8,7 +8,9 @@ import triton
 
 from sglang.kernels.ops.attention.sensenova_int8 import (
     _int8_prefix_attention,
+    int8_image_attention,
     int8_prefix_attention,
+    quantize_image_kv,
 )
 from sglang.multimodal_gen.runtime.layers.kvcache.sensenova import (
     Int8DenoisingCache,
@@ -21,6 +23,90 @@ register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestSenseNovaInt8Attention(CustomTestCase):
+    @torch.inference_mode()
+    def test_image_quantization_and_attention(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            for p, s, d, shared in (
+                (0, 17, 64, True),
+                (3, 33, 80, False),
+                (65, 71, 128, True),
+                (1, 5, 256, True),
+            ):
+                with self.subTest(dtype=dtype, prefix=p, dimension=d):
+                    torch.manual_seed(42)
+                    pk = torch.randn(
+                        1 if shared else 2, 2, p, d, device="cuda", dtype=dtype
+                    )
+                    pv = torch.randn_like(pk)
+                    for step in range(2):
+                        q = torch.randn(
+                            2, s, 4, d, device="cuda", dtype=dtype
+                        ).transpose(1, 2)
+                        k = torch.randn(
+                            2, s, 2, d, device="cuda", dtype=dtype
+                        ).transpose(1, 2)
+                        v = torch.randn_like(k)
+                        k[:, :, 0] = 0
+                        v[:, :, 0] = 0
+                        ik, iv, ks, vs = quantize_image_kv(k, v)
+                        for source, quant, scale in ((k, ik, ks), (v, iv, vs)):
+                            self.assertTrue(torch.isfinite(scale).all())
+                            self.assertTrue(quant.is_contiguous())
+                            self.assertTrue(
+                                (
+                                    (
+                                        quant.float() * scale[..., None]
+                                        - source.float()
+                                    ).abs()
+                                    <= scale[..., None] * 0.501 + 1e-6
+                                ).all()
+                            )
+                        output = int8_image_attention(
+                            q, ik, iv, pk, pv, ks, vs, d**-0.5
+                        )
+
+                        def reference(keys, values):
+                            return F.scaled_dot_product_attention(
+                                q.float(),
+                                torch.cat(
+                                    (pk.expand(2, -1, -1, -1).float(), keys.float()), 2
+                                ),
+                                torch.cat(
+                                    (pv.expand(2, -1, -1, -1).float(), values.float()),
+                                    2,
+                                ),
+                                enable_gqa=True,
+                            ).transpose(1, 2)
+
+                        dequant = reference(
+                            (ik.float() * ks[..., None]).to(dtype),
+                            (iv.float() * vs[..., None]).to(dtype),
+                        )
+                        torch.testing.assert_close(
+                            output.float(), dequant, atol=0.015, rtol=0.015
+                        )
+                        full = reference(k, v)
+                        self.assertLess(
+                            ((output.float() - full).norm() / full.norm()).item(), 0.025
+                        )
+                        if step == 0:
+                            previous = ik.clone()
+                        else:
+                            self.assertFalse(torch.equal(previous, ik))
+
+    def test_image_quantization_rejects_invalid_inputs(self):
+        with self.assertRaises(ValueError):
+            quantize_image_kv(torch.zeros(1, 1, 1, 64), torch.zeros(1, 1, 1, 64))
+        k = torch.zeros(1, 1, 2, 64, device="cuda", dtype=torch.float16)
+        with self.assertRaises(ValueError):
+            quantize_image_kv(k, k.float())
+        ik, iv, ks, vs = quantize_image_kv(k, k)
+        prefix = k[:, :, :0].contiguous()
+        with self.assertRaises(ValueError):
+            int8_image_attention(k, ik, iv, prefix, prefix, ks.double(), vs, 0.125)
+        with self.assertRaises(ValueError):
+            int8_image_attention(k, ik, iv, prefix.float(), prefix, ks, vs, 0.125)
+
     @torch.inference_mode()
     def test_unquantized_prefix_specialization(self):
         for dtype in (torch.float16, torch.bfloat16):

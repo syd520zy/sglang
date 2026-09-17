@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bidirectional image attention over an INT8 prefix and FP16/BF16 image K/V.
+"""Bidirectional SenseNova attention with tile-local INT8 KV dequantization.
 
-Dequantization is tile-local. Both segments share one online softmax, rather than
-normalizing the prefix and image attention separately. No full-precision prefix
-or concatenated KV tensor is written to device memory.
+Prefix and image segments share one online softmax. The production entry point
+quantizes the prefix; the experimental image entry point keeps the prefix in
+FP16/BF16 and quantizes current image K/V every step.
 """
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
@@ -35,6 +36,8 @@ def _int8_prefix_attention(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BD: tl.constexpr,
+    IMAGE_KS=None,
+    IMAGE_VS=None,
 ):
     block = tl.program_id(0)
     head = tl.program_id(1)
@@ -104,6 +107,12 @@ def _int8_prefix_attention(
                     (tokens[:, None] < S) & (dims[None, :] < D),
                     other=0,
                 )
+                if K.dtype.element_ty == tl.int8:
+                    si = (batch * HKV + kv_head) * S + tokens
+                    key_scale = tl.load(IMAGE_KS + si, tokens < S, other=0)
+                    value_scale = tl.load(IMAGE_VS + si, tokens < S, other=0)
+                    key = (key.to(tl.float32) * key_scale[None, :]).to(q.dtype)
+                    value = (value.to(tl.float32) * value_scale[:, None]).to(q.dtype)
             scores = tl.dot(q, key) * (SCALE * 1.4426950408889634)
             scores = tl.where(tokens[None, :] < length, scores, float("-inf"))
             new_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
@@ -184,6 +193,163 @@ def int8_prefix_attention(q, k, v, prefix_k, prefix_v, k_scale, v_scale, softmax
         32,
         64,
         max(16, triton.next_power_of_2(d)),
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+@triton.jit
+def _quantize_image_kv(
+    K,
+    V,
+    IK,
+    IV,
+    KS,
+    VS,
+    k_stride: tl.constexpr,
+    v_stride: tl.constexpr,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    BD: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    dims = tl.arange(0, BD)
+    ki = batch * k_stride[0] + head * k_stride[1] + token * k_stride[2]
+    vi = batch * v_stride[0] + head * v_stride[1] + token * v_stride[2]
+    key = tl.load(K + ki + dims * k_stride[3], dims < D, other=0).to(tl.float32)
+    value = tl.load(V + vi + dims * v_stride[3], dims < D, other=0).to(tl.float32)
+    ks = tl.maximum(tl.max(tl.abs(key), 0), 1e-12) / 127.0
+    vs = tl.maximum(tl.max(tl.abs(value), 0), 1e-12) / 127.0
+    index = (batch * H + head) * S + token
+    tl.store(KS + index, ks)
+    tl.store(VS + index, vs)
+    # Round-to-nearest-even, matching the prefix quantizer.
+    qk = libdevice.nearbyint(key / ks)
+    qv = libdevice.nearbyint(value / vs)
+    tl.store(
+        IK + index * D + dims,
+        tl.minimum(tl.maximum(qk, -127), 127).to(tl.int8),
+        dims < D,
+    )
+    tl.store(
+        IV + index * D + dims,
+        tl.minimum(tl.maximum(qv, -127), 127).to(tl.int8),
+        dims < D,
+    )
+
+
+def quantize_image_kv(k, v):
+    """Quantize current [B,Hkv,S,D] K/V together; call again every denoising step.
+
+    K must already include normalization and RoPE. Inputs must be finite.
+    Returns contiguous INT8 K/V and FP32 per-token/head scales.
+    """
+    if not k.is_cuda or torch.version.hip is not None:
+        raise ValueError("Image KV quantization requires NVIDIA CUDA")
+    if k.ndim != 4 or v.shape != k.shape or min(k.shape) <= 0 or k.shape[-1] > 256:
+        raise ValueError("Expected matching nonempty [B,Hkv,S,D] K/V with D <= 256")
+    if (
+        k.dtype not in (torch.float16, torch.bfloat16)
+        or v.dtype != k.dtype
+        or v.device != k.device
+    ):
+        raise ValueError("K/V must share FP16/BF16 dtype and device")
+    ik = torch.empty(k.shape, device=k.device, dtype=torch.int8)
+    iv = torch.empty_like(ik)
+    ks = torch.empty(k.shape[:3], device=k.device, dtype=torch.float32)
+    vs = torch.empty_like(ks)
+    b, h, s, d = k.shape
+    _quantize_image_kv[(s, h, b)](
+        k,
+        v,
+        ik,
+        iv,
+        ks,
+        vs,
+        k.stride(),
+        v.stride(),
+        h,
+        s,
+        d,
+        triton.next_power_of_2(d),
+        num_warps=4,
+    )
+    return ik, iv, ks, vs
+
+
+def int8_image_attention(q, k, v, prefix_k, prefix_v, k_scale, v_scale, softmax_scale):
+    """Experimental inference attention: INT8 image KV, full-precision prefix.
+
+    Inputs use [B,H,S,D]; output uses [B,S,H,D]. No mask or dropout.
+    Quantization is separate so callers can measure its per-step cost.
+    """
+    if not q.is_cuda or torch.version.hip is not None:
+        raise ValueError("Image INT8 attention requires NVIDIA CUDA")
+    if q.ndim != 4 or min(q.shape) <= 0 or q.shape[-1] > 256:
+        raise ValueError("Expected nonempty [B,H,S,D] Q with D <= 256")
+    b, h, s, d = q.shape
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("Q must be FP16/BF16")
+    if k.ndim != 4 or v.shape != k.shape or k.shape[1] <= 0:
+        raise ValueError("Expected matching [B,Hkv,S,D] image K/V")
+    hk = k.shape[1]
+    if (k.shape[0], *k.shape[2:]) != (b, s, d) or h % hk:
+        raise ValueError("Image K/V must match Q dimensions and support GQA")
+    for kv, scale in ((k, k_scale), (v, v_scale)):
+        if kv.dtype != torch.int8 or not kv.is_contiguous():
+            raise ValueError("Image K/V must be contiguous INT8")
+        if (
+            scale.shape != kv.shape[:3]
+            or scale.dtype != torch.float32
+            or not scale.is_contiguous()
+        ):
+            raise ValueError("Image scales must be contiguous FP32 [B,Hkv,S]")
+    for prefix in (prefix_k, prefix_v):
+        if (
+            prefix.ndim != 4
+            or prefix.shape[0] not in (1, b)
+            or prefix.shape[1] != hk
+            or prefix.shape[3] != d
+        ):
+            raise ValueError(
+                "Prefix must match KV heads/dimension and have batch 1 or B"
+            )
+        if prefix.dtype != q.dtype or not prefix.is_contiguous():
+            raise ValueError("Prefix must be contiguous with Q dtype")
+    if prefix_k.shape[2] != prefix_v.shape[2]:
+        raise ValueError("Prefix K/V lengths must match")
+    if any(t.device != q.device for t in (k, v, prefix_k, prefix_v, k_scale, v_scale)):
+        raise ValueError("All inputs must share a device")
+    out = torch.empty((b, s, h, d), device=q.device, dtype=q.dtype)
+    _int8_prefix_attention[(triton.cdiv(s, 64), h, b)](
+        q,
+        k,
+        v,
+        prefix_k,
+        prefix_v,
+        k_scale,
+        v_scale,
+        out,
+        q.stride(),
+        k.stride(),
+        v.stride(),
+        h,
+        hk,
+        s,
+        prefix_k.shape[2],
+        d,
+        prefix_k.shape[0] == 1,
+        prefix_v.shape[0] == 1,
+        softmax_scale,
+        64,
+        32,
+        max(16, triton.next_power_of_2(d)),
+        IMAGE_KS=k_scale,
+        IMAGE_VS=v_scale,
         num_warps=4,
         num_stages=2,
     )

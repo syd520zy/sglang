@@ -15,7 +15,9 @@ import triton.testing
 
 from sglang.kernels.ops.attention.sensenova_int8 import (
     _int8_prefix_attention,
+    int8_image_attention,
     int8_prefix_attention,
+    quantize_image_kv,
 )
 from sglang.multimodal_gen.runtime.layers.kvcache.sensenova import (
     quantize_prefix,
@@ -70,8 +72,17 @@ def main():
         action="store_true",
         help="Measure experimental tile sizes; production defaults stay unchanged",
     )
+    parser.add_argument("--quantize-image", action="store_true")
+    parser.add_argument("--resolution", type=int, choices=(512, 1024, 2048, 4096))
+    parser.add_argument("--effective-patch-size", type=int, default=32)
     parser.add_argument("--rounds", type=int, default=7)
     args = parser.parse_args()
+    if args.effective_patch_size <= 0:
+        parser.error("effective-patch-size must be positive")
+    if args.resolution is not None:
+        if args.resolution % args.effective_patch_size:
+            parser.error("Resolution must be divisible by effective-patch-size")
+        args.image_tokens = (args.resolution // args.effective_patch_size) ** 2
     b, p, s, h, hk, d = (
         args.batch_size,
         args.prefix_length,
@@ -166,6 +177,77 @@ def main():
             num_stages=2,
         )
         return out
+
+    if args.quantize_image:
+        image_k, image_v, image_ks, image_vs = quantize_image_kv(k, v)
+
+        def image_attention():
+            return int8_image_attention(
+                q, image_k, image_v, pk, pv, image_ks, image_vs, d**-0.5
+            )
+
+        def image_total():
+            new_k, new_v, new_ks, new_vs = quantize_image_kv(k, v)
+            return int8_image_attention(
+                q, new_k, new_v, pk, pv, new_ks, new_vs, d**-0.5
+            )
+
+        functions = {
+            "model_sdpa": partial(baseline, "sdpa"),
+            "native_gqa": partial(baseline, "sdpa-gqa"),
+            "unquantized_separated": partial(separated, False, 64, 32, 4),
+            "image_int8_attention": image_attention,
+            "image_int8_total": image_total,
+        }
+        ref = baseline("sdpa-gqa").float()
+        errors = {}
+        for name, fn in functions.items():
+            result = fn().float()
+            error = ((result - ref).norm() / ref.norm().clamp_min(1e-12)).item()
+            if not torch.isfinite(result).all() or not 0 <= error <= 0.025:
+                raise AssertionError(f"{name} relative L2 error: {error}")
+            errors[name] = error
+        del ref, result
+        functions["image_quantization"] = partial(quantize_image_kv, k, v)
+        timings = measure_interleaved(functions, args.rounds)
+        # All comparison buffers remain resident. This measures only the
+        # additional live allocations of each invocation, not model peak memory.
+        extra_peak = {}
+        for name, fn in functions.items():
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            result = fn()
+            torch.cuda.synchronize()
+            extra_peak[name] = torch.cuda.max_memory_allocated() - before
+            del result
+        print(
+            json.dumps(
+                {
+                    "benchmark_version": 4,
+                    "quantization_target": "image_kv",
+                    "device": torch.cuda.get_device_name(),
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "triton": triton.__version__,
+                    **vars(args),
+                    "timings": timings,
+                    "relative_l2_errors": errors,
+                    "extra_peak_allocated_bytes": extra_peak,
+                    "image_fp_bytes_per_layer": k.nbytes + v.nbytes,
+                    "image_int8_bytes_per_layer": sum(
+                        t.nbytes for t in (image_k, image_v, image_ks, image_vs)
+                    ),
+                    "shared_prefix_bytes_per_layer": pk.nbytes + pv.nbytes,
+                    "speedup_vs_native_gqa": timings["native_gqa"]["median_ms"]
+                    / timings["image_int8_total"]["median_ms"],
+                    "speedup_vs_model_sdpa": timings["model_sdpa"]["median_ms"]
+                    / timings["image_int8_total"]["median_ms"],
+                },
+                indent=2,
+            )
+        )
+        return
 
     ref = baseline("sdpa").float()
     functions = {

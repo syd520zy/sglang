@@ -126,3 +126,35 @@ bash benchmark/kernels/attention/run_sensenova_int8_sweep.sh
 可传入结果目录作为第一个参数。脚本先跑三个测试文件，再扫描两种精度 × batch 1/2/4 × prefix 256/1024/4096，共 18 组；每组扫描四个分块，图像 tokens 固定为 1024。默认 head 参数仍是合成配置，不代表所有模型。脚本不更新仓库、不安装依赖。
 
 每组输出 JSON 和 stderr，`status.csv` 记录退出码。测试失败立即停止；某组 benchmark 失败则保留日志并继续其他组，最终以非零状态退出。运行时尽量保持 GPU 无其他任务；完成后提供整个结果目录，重点比较原生 GQA、未量化分离 KV、INT8 在相同配置下的耗时和波动，再选择端到端验证路径。
+
+
+## 图像 KV INT8 实验（独立算子，尚未接入模型）
+
+本实验量化每层、每步重新生成的图像 K/V，前缀保持 FP16/BF16。K 的输入位置必须在归一化和 RoPE 后，V 在投影后。一个 Triton kernel 同时量化 K/V，每 token/head 分别保存一个 FP32 scale；attention 内逐块反量化，并对前缀和图像使用同一个 softmax。Q、输出和矩阵乘法输入仍为 FP16/BF16，不减少 attention 的乘法量。
+
+图像量化不使用 `sensenova_kv_cache_dtype=int8` 开关；该开关仍只控制之前的前缀缓存。本阶段用于先判断逐步量化成本能否得到回报，尚不能宣称完整模型画质或吞吐通过验证。
+
+```bash
+cd /workspace/sglang
+bash benchmark/kernels/attention/run_sensenova_image_int8_sweep.sh
+```
+
+脚本覆盖 FP16/BF16 × batch 1/2 × 分辨率 512/1024/2048/4096，共 16 组，前缀固定 256。按有效 patch=32，对应图像 tokens 256/1024/4096/16384；这是默认配置假设，实际权重需要核对 `vision_config.patch_size * int(1 / downsample_ratio)`。单次运行可指定不同的有效 patch：
+
+```bash
+python benchmark/kernels/attention/bench_sensenova_int8.py --quantize-image --resolution 2048 --effective-patch-size 32 --dtype bf16 --batch-size 1 --rounds 7
+```
+
+- `image_quantization`：每步融合量化的耗时，含输出分配。
+- `image_int8_attention`：已有 INT8 图像 KV 时的 attention 耗时。
+- `image_int8_total`：实际连续执行量化和 attention 的总耗时（非两项中位数相加）。加速比使用这一项，与原生 GQA 和模型 SDPA 分别比较。
+- `unquantized_separated`：相同 64×32、4 warps 分块，图像 KV 保持高精度。
+- `image_fp_bytes_per_layer` / `image_int8_bytes_per_layer`：当前 batch 的图像 KV 表示大小，后者包含 scale；不是整模型或 allocator 峰值。
+- `extra_peak_allocated_bytes`：比较缓存全部驻留时，每次调用额外产生的 allocated 峰值；不含驻留的原始输入，不能据此推算部署总显存。当前实现量化时原始图像 K/V 仍存活，会增加 INT8 张量和 scale；需后续模型接入和生命周期优化才能评估净显存收益。
+
+所有 attention 对照先检查有限输出与相对 L2 误差 <= 0.025，再进行七轮计时。GPU 单测另比较显式反量化参考，覆盖空前缀、非连续输入、非整块长度、GQA、共享/独立前缀和两次图像 KV 更新。当前误差界限只用于合成数据筛查，不代表图像质量验收。
+
+每组失败保留 stderr 和退出码，包括 OOM；其余配置继续执行。高分辨率可能耗时较长，失败的 JSON 可能为空，应先查看 status.csv。
+
+
+图像实验本地验证：SM80/SM89、FP16/BF16、head dimension 128/256 的融合量化与 attention 离线编译通过；旧前缀分支离线编译及 FP16 解释器回归通过。图像 attention 的 FP16 解释器验证使用独立的高精度量化参考提供 INT8 输入，空前缀和非整块长度在容差内。本地解释器不能执行 libdevice 舍入函数，融合量化数值与 BF16 执行仍需新增 GPU 单测确认。以上均不是 4090 性能或端到端验证。
