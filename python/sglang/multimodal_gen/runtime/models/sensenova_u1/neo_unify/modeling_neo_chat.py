@@ -2,6 +2,7 @@
 
 import contextlib
 import math
+import time
 from typing import List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
@@ -26,6 +27,33 @@ from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 
 logger = logging.get_logger(__name__)
+
+
+class _SenseNovaStageTimer:
+    def __init__(self, enabled: bool, device: torch.device):
+        self.enabled = enabled
+        self.device = device
+        self.timings_ms = {}
+        self.started_at = self.last_mark = time.perf_counter()
+
+    def mark(self, name: str) -> None:
+        if not self.enabled:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        now = time.perf_counter()
+        self.timings_ms[name] = round((now - self.last_mark) * 1000, 3)
+        self.last_mark = now
+
+    def finish(self) -> dict[str, float]:
+        if not self.enabled:
+            return {}
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.timings_ms["total"] = round(
+            (time.perf_counter() - self.started_at) * 1000, 3
+        )
+        return self.timings_ms
 
 
 def version_cmp(v1, v2, op="eq"):
@@ -294,6 +322,7 @@ class NEOChatModel(PreTrainedModel):
         self.img_start_token_id = 151670
         self.last_think_content = ""
         self.last_think_token_count = 0
+        self.last_profile_timings_ms = {}
         self.conv_template = get_conv_template(self.template)
         self.system_message = self.conv_template.system_message
 
@@ -2313,7 +2342,10 @@ class NEOChatModel(PreTrainedModel):
         think_mode=False,
         seed=0,
         max_think_tokens=1024,
+        profile_stages=False,
     ):
+        profiler = _SenseNovaStageTimer(profile_stages, self.device)
+        self.last_profile_timings_ms = {}
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
         self._notify_layer_offload_phase("prefix")
@@ -2375,6 +2407,7 @@ class NEOChatModel(PreTrainedModel):
             if indexes_uncondition is not None
             else None
         )
+        profiler.mark("input_prepare")
 
         if think_mode:
             outputs_condition = self._think_prefix_forward(
@@ -2386,6 +2419,7 @@ class NEOChatModel(PreTrainedModel):
             device = outputs_condition.logits.device
             dtype = outputs_condition.logits.dtype
             t_index_condition = indexes_condition[0].max().item()
+            profiler.mark("condition_prefill")
             past_key_values_condition, t_index_condition, think_text = (
                 self._generate_think(
                     tokenizer,
@@ -2396,6 +2430,7 @@ class NEOChatModel(PreTrainedModel):
                     max_think_tokens=max_think_tokens,
                 )
             )
+            profiler.mark("think_decode")
             indexes_image_condition = self._build_t2i_image_indexes(
                 token_h,
                 token_w,
@@ -2410,6 +2445,9 @@ class NEOChatModel(PreTrainedModel):
             device = prefix_hidden_states.device
             dtype = prefix_hidden_states.dtype
             del prefix_hidden_states
+            profiler.mark("condition_prefill")
+            if profile_stages:
+                profiler.timings_ms["think_decode"] = 0.0
         past_key_values_uncondition = None
         if input_ids_uncondition is not None:
             past_key_values_uncondition, _ = self._t2i_prefix_forward(
@@ -2417,6 +2455,7 @@ class NEOChatModel(PreTrainedModel):
                 indexes_uncondition,
                 attention_mask_uncondition_prefix,
             )
+        profiler.mark("cfg_prefill")
 
         del input_ids_condition, indexes_condition, attention_mask_condition_prefix
         if input_ids_uncondition is not None:
@@ -2494,6 +2533,7 @@ class NEOChatModel(PreTrainedModel):
             timesteps = self._apply_time_schedule(
                 timesteps, token_h * token_w, timestep_shift
             )
+        profiler.mark("denoise_prepare")
 
         for step_i in range(num_steps):
             t = timesteps[step_i]
@@ -2596,8 +2636,10 @@ class NEOChatModel(PreTrainedModel):
         clear_flash_kv_cache(past_key_values_condition)
         if past_key_values_uncondition is not None:
             clear_flash_kv_cache(past_key_values_uncondition)
+        profiler.mark("denoise_loop")
 
         self.last_think_content = think_text
+        self.last_profile_timings_ms = profiler.finish()
         if think_mode:
             return image_prediction, think_text
         return image_prediction

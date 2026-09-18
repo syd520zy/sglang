@@ -36,6 +36,7 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "quality",
     "think_mode",
     "max_think_tokens",
+    "profile_stages",
 }
 
 
@@ -55,6 +56,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
     max_think_tokens: int = DEFAULT_MAX_THINK_TOKENS
+    profile_stages: bool = False
     negative_prompt: None = field(default=None, init=False)
 
     @classmethod
@@ -63,7 +65,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
 
     @classmethod
     def image_request_extra_fields(cls) -> frozenset[str]:
-        return frozenset({"think_mode", "max_think_tokens"})
+        return frozenset({"think_mode", "max_think_tokens", "profile_stages"})
 
     @classmethod
     def get_cli_args(cls, args):
@@ -108,6 +110,10 @@ class SenseNovaU1SamplingParams(SamplingParams):
             )
         if not isinstance(self.think_mode, bool):
             raise TypeError(f"think_mode must be a bool, got {self.think_mode!r}")
+        if not isinstance(self.profile_stages, bool):
+            raise TypeError(
+                f"profile_stages must be a bool, got {self.profile_stages!r}"
+            )
         if isinstance(self.max_think_tokens, bool) or not isinstance(
             self.max_think_tokens, int
         ):
@@ -130,5 +136,6 @@ class SenseNovaU1SamplingParams(SamplingParams):
             "t_eps": self.t_eps,
             "think_mode": self.think_mode,
             "max_think_tokens": self.max_think_tokens,
+            "profile_stages": self.profile_stages,
         }
         return extra

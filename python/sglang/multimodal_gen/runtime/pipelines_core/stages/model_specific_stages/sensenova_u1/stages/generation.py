@@ -39,6 +39,7 @@ class SenseNovaU1GenerationOptions:
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
     max_think_tokens: int = DEFAULT_MAX_THINK_TOKENS
+    profile_stages: bool = False
 
     @classmethod
     def from_batch(cls, batch: Req) -> SenseNovaU1GenerationOptions:
@@ -55,6 +56,7 @@ class SenseNovaU1GenerationOptions:
             max_think_tokens=int(
                 extra.get("max_think_tokens", DEFAULT_MAX_THINK_TOKENS)
             ),
+            profile_stages=bool(extra.get("profile_stages", False)),
         )
 
 
@@ -92,6 +94,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             t_eps=options.t_eps,
             think_mode=options.think_mode,
             max_think_tokens=options.max_think_tokens,
+            profile_stages=options.profile_stages,
             seed=seed,
         )
         think_text = None
@@ -102,16 +105,18 @@ class SenseNovaU1GenerationStage(PipelineStage):
 
         images = _denorm_sensenova_output(images)
         samples = [sample.contiguous() for sample in images]
-        usage = None
+        usage = {}
         if think_text is not None:
-            usage = {
-                "think_text": think_text,
-                "reasoning_tokens": int(
-                    getattr(self.model, "last_think_token_count", 0)
-                ),
-            }
+            usage.update(
+                think_text=think_text,
+                reasoning_tokens=int(getattr(self.model, "last_think_token_count", 0)),
+            )
+        if options.profile_stages:
+            usage["stage_timings_ms"] = dict(
+                getattr(self.model, "last_profile_timings_ms", {})
+            )
         return OutputBatch(
             output=samples,
             metrics=batch.metrics,
-            usage=usage,
+            usage=usage or None,
         )

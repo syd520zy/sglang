@@ -65,6 +65,16 @@ class _FakeSenseNovaModel:
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
+        if kwargs["profile_stages"]:
+            self.last_profile_timings_ms = {
+                "input_prepare": 1.0,
+                "condition_prefill": 2.0,
+                "think_decode": 3.0 if kwargs["think_mode"] else 0.0,
+                "cfg_prefill": 4.0,
+                "denoise_prepare": 5.0,
+                "denoise_loop": 6.0,
+                "total": 18.0 if kwargs["think_mode"] else 15.0,
+            }
         image = torch.tensor(
             [
                 [
@@ -615,6 +625,7 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
         timestep_shift=9.0,
         think_mode=True,
         max_think_tokens=128,
+        profile_stages=True,
     )
 
     cli_args = SenseNovaU1SamplingParams.get_cli_args(args)
@@ -629,17 +640,23 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert "timestep_shift" not in cli_args
     assert cli_args["think_mode"] is True
     assert cli_args["max_think_tokens"] == 128
+    assert cli_args["profile_stages"] is True
 
 
 def test_sensenova_u1_thinking_fields_remain_model_specific():
     request = ImageGenerationsRequest(
         prompt="a mountain lake",
-        extra_body={"think_mode": True, "max_think_tokens": 128},
+        extra_body={
+            "think_mode": True,
+            "max_think_tokens": 128,
+            "profile_stages": True,
+        },
     )
 
     assert _image_request_model_kwargs(request, SenseNovaU1SamplingParams) == {
         "think_mode": True,
         "max_think_tokens": 128,
+        "profile_stages": True,
     }
 
 
@@ -658,6 +675,11 @@ def test_sensenova_u1_rejects_non_integer_think_token_budget(max_think_tokens):
 def test_sensenova_u1_rejects_non_boolean_think_mode():
     with pytest.raises(TypeError, match="think_mode"):
         SenseNovaU1SamplingParams(think_mode="true")
+
+
+def test_sensenova_u1_rejects_non_boolean_stage_profiling():
+    with pytest.raises(TypeError, match="profile_stages"):
+        SenseNovaU1SamplingParams(profile_stages="true")
 
 
 def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():
@@ -705,7 +727,39 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["seed"] == 123
     assert model.call_kwargs["think_mode"] is False
     assert model.call_kwargs["max_think_tokens"] == DEFAULT_MAX_THINK_TOKENS
+    assert model.call_kwargs["profile_stages"] is False
     assert output.usage is None
+
+
+def test_sensenova_u1_generation_stage_returns_profile_timings():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=1024,
+        height=1024,
+        profile_stages=True,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=1,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+
+    output = SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    assert model.call_kwargs["profile_stages"] is True
+    assert output.usage == {"stage_timings_ms": model.last_profile_timings_ms}
+    assert (
+        ImageUsage.model_validate(output.usage).stage_timings_ms["denoise_loop"] == 6.0
+    )
 
 
 def test_sensenova_u1_generation_stage_returns_thinking_usage():

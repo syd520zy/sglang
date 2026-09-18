@@ -27,6 +27,7 @@ class ImageUsage(BaseModel):
     prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
     think_text: Optional[str] = None
+    stage_timings_ms: Optional[Dict[str, float]] = None
     image_count: Optional[int] = None
 
 
