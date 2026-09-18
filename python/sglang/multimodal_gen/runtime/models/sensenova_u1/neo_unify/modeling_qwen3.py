@@ -54,7 +54,7 @@ except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash 
 #                    debugging, even when flash-attn is available).
 _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
 _ATTN_BACKEND: str = "auto"
-_USE_CUDA_TEXT_SDPA = os.environ.get("SENSENOVA_TEXT_ATTN_BACKEND", "sdpa") == "sdpa"
+_USE_CUDA_TEXT_SDPA = os.environ.get("SENSENOVA_TEXT_ATTN_BACKEND", "eager") == "sdpa"
 
 
 def set_attn_backend(backend: str) -> str:

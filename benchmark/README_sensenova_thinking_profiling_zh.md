@@ -48,9 +48,9 @@ SENSENOVA_TEXT_ATTN_BACKEND=eager SENSENOVA_THINK_KV_CACHE=dynamic \
 OUTPUT_DIR=/workspace/sensenova-thinking-profile-baseline \
   bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
 
-SENSENOVA_TEXT_ATTN_BACKEND=sdpa SENSENOVA_THINK_KV_CACHE=preallocated \
+SENSENOVA_TEXT_ATTN_BACKEND=eager SENSENOVA_THINK_KV_CACHE=preallocated \
 OUTPUT_DIR=/workspace/sensenova-thinking-profile-optimized \
   bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
 ```
 
-两次运行使用相同提示词、种子和 token 上限。对比 `profile/summary.json` 中的 `think_decode_ms_per_token` 和 `profile/records.json` 中相同 case/seed 的 `think_text_sha256`；散列一致表示思考文本逐字一致。两个开关也可单独切换，以拆分 SDPA 与预分配 KV 缓存各自的收益。此优化只作用于 CUDA 的思考文本解码，普通前缀和图像去噪 attention 路径保持原样。
+两次运行使用相同提示词、种子和 token 上限。对比 `profile/summary.json` 中的 `think_decode_ms_per_token` 和 `profile/records.json` 中相同 case/seed 的 `think_text_sha256`；散列一致表示思考文本逐字一致。4090 交叉测试中，单独开启预分配 KV 缓存保持了 64-token 思考文本一致，单独开启 SDPA 则改变了文本且未带来速度收益。因此 CUDA 思考注意力默认使用 eager，SDPA 仅在显式设置 `SENSENOVA_TEXT_ATTN_BACKEND=sdpa` 时启用；预分配缓存仍为默认。此优化只作用于 CUDA 的思考文本解码，普通前缀和图像去噪 attention 路径保持原样。
