@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+    modeling_qwen3_moe,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
     NEOVisionConfig,
 )
@@ -49,6 +52,9 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     _sdpa_text_attention,
     eager_attention_forward,
+)
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3_moe import (
+    Qwen3MoeSparseMoeBlock,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -899,6 +905,36 @@ def test_sensenova_text_sdpa_matches_eager_gqa(query_length, key_length):
     actual = _sdpa_text_attention(query, key, value, mask, scaling=0.125)
 
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("n_tokens", [1, 3])
+def test_sensenova_single_token_moe_dispatch_matches_all_experts(
+    monkeypatch, dtype, n_tokens
+):
+    torch.manual_seed(42)
+    config = SimpleNamespace(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        hidden_act="silu",
+        num_experts=8,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    block = Qwen3MoeSparseMoeBlock(config).to(device="cuda", dtype=dtype).eval()
+    hidden_states = torch.randn(1, n_tokens, 32, device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        monkeypatch.setattr(
+            modeling_qwen3_moe, "_USE_TOPK_SINGLE_TOKEN_DISPATCH", False
+        )
+        expected = block(hidden_states)
+        monkeypatch.setattr(modeling_qwen3_moe, "_USE_TOPK_SINGLE_TOKEN_DISPATCH", True)
+        actual = block(hidden_states)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():

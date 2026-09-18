@@ -54,3 +54,17 @@ OUTPUT_DIR=/workspace/sensenova-thinking-profile-optimized \
 ```
 
 两次运行使用相同提示词、种子和 token 上限。对比 `profile/summary.json` 中的 `think_decode_ms_per_token` 和 `profile/records.json` 中相同 case/seed 的 `think_text_sha256`；散列一致表示思考文本逐字一致。4090 交叉测试中，单独开启预分配 KV 缓存保持了 64-token 思考文本一致，单独开启 SDPA 则改变了文本且未带来速度收益。因此 CUDA 思考注意力默认使用 eager，SDPA 仅在显式设置 `SENSENOVA_TEXT_ATTN_BACKEND=sdpa` 时启用；预分配缓存仍为默认。此优化只作用于 CUDA 的思考文本解码，普通前缀和图像去噪 attention 路径保持原样。
+
+下一阶段测试 MoE 单 token 分发。原路径逐个检查所有专家；实验路径只处理路由选中的 top-k 专家。实验路径默认关闭，只在 CUDA 推理且输入为单 token 时生效：
+
+```bash
+BUDGETS=64,128,256 REPEATS=2 SENSENOVA_MOE_SINGLE_TOKEN_DISPATCH=all \
+OUTPUT_DIR=/workspace/sensenova-thinking-moe-baseline \
+  bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
+
+BUDGETS=64,128,256 REPEATS=2 SENSENOVA_MOE_SINGLE_TOKEN_DISPATCH=topk \
+OUTPUT_DIR=/workspace/sensenova-thinking-moe-topk \
+  bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
+```
+
+先核对两组的单测和每个 case/seed 的 `reasoning_tokens`、`think_text_sha256`，再比较 `think_decode_ms_per_token`。如文本不一致，不应只凭耗时启用实验路径。

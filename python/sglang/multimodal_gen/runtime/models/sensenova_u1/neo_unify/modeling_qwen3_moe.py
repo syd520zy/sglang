@@ -1,5 +1,6 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -28,6 +29,10 @@ from .transformers_compat import (
     causal_mask_kwargs,
     model_input_compat,
     tied_weights_keys,
+)
+
+_USE_TOPK_SINGLE_TOKEN_DISPATCH = (
+    os.environ.get("SENSENOVA_MOE_SINGLE_TOKEN_DISPATCH", "all") == "topk"
 )
 
 
@@ -121,6 +126,26 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         output = torch.zeros(
             (n_tokens, hidden_dim), dtype=flat.dtype, device=flat.device
         )
+        if (
+            _USE_TOPK_SINGLE_TOKEN_DISPATCH
+            and n_tokens == 1
+            and flat.is_cuda
+            and not self.training
+            and not torch.is_grad_enabled()
+        ):
+            top_x = torch.zeros(1, dtype=torch.long, device=flat.device)
+            current_state = flat.index_select(0, top_x)
+            for expert_idx, rank in sorted(
+                (expert_idx, rank)
+                for rank, expert_idx in enumerate(selected_experts[0].tolist())
+            ):
+                current_out = (
+                    self.experts[expert_idx](current_state)
+                    * routing_weights[:, rank : rank + 1]
+                )
+                output.index_add_(0, top_x, current_out.to(flat.dtype))
+            return output.view(*orig_shape)
+
         # (num_experts, top_k, num_tokens)
         expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(
             2, 1, 0
