@@ -1,6 +1,7 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
 import copy
+import os
 from typing import Callable, Optional, Union
 
 import torch
@@ -53,6 +54,7 @@ except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash 
 #                    debugging, even when flash-attn is available).
 _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
 _ATTN_BACKEND: str = "auto"
+_USE_CUDA_TEXT_SDPA = os.environ.get("SENSENOVA_TEXT_ATTN_BACKEND", "sdpa") == "sdpa"
 
 
 def set_attn_backend(backend: str) -> str:
@@ -309,6 +311,22 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
+
+
+def _sdpa_text_attention(query, key, value, attention_mask, scaling):
+    mask = attention_mask[..., : key.shape[-2]] if attention_mask is not None else None
+    if mask is not None and mask.dtype != torch.bool:
+        mask = mask.to(query.dtype)
+    output = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=mask,
+        dropout_p=0.0,
+        scale=scaling,
+        enable_gqa=query.shape[1] != key.shape[1],
+    )
+    return output.transpose(1, 2).contiguous()
 
 
 def _compute_default_rope_parameters(config, device=None, **_kwargs):
@@ -570,23 +588,38 @@ class Qwen3Attention(nn.Module):
                     )  # concat on seq_len
                     value_states = torch.cat([past_v, value_states], dim=2)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
+        if (
+            _USE_CUDA_TEXT_SDPA
+            and kwargs.get("sensenova_text_sdpa", False)
+            and query_states.is_cuda
+            and not self.training
+        ):
+            attn_output = _sdpa_text_attention(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                self.scaling,
+            )
+            attn_weights = None
+        else:
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[
+                    self.config._attn_implementation
+                ]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

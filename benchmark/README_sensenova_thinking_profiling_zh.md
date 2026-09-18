@@ -39,4 +39,18 @@ REPEATS=3 BUDGETS=64,128,256 OUTPUT_DIR=/workspace/sensenova-thinking-profile \
 - `denoise_loop`：全部图像去噪步骤。
 - `total`：模型 `t2i_generate` 总耗时。
 
-重点看 `think_decode_ms_per_token` 和 `denoise_delta_vs_off_ms`。前者随 token 上限明显上升，说明 DynamicCache 扩容或长上下文 attention 的影响较大；后者明显上升，说明思考 KV 加长了后续图像去噪。
+重点看 `think_decode_ms_per_token` 和 `denoise_delta_vs_off_ms`。首次 4090 测试约为 92–93 ms/token，而去噪耗时没有明显增长；优化目标是降低文本逐 token 解码耗时。
+
+对比优化前后的文本解码，分别运行：
+
+```bash
+SENSENOVA_TEXT_ATTN_BACKEND=eager SENSENOVA_THINK_KV_CACHE=dynamic \
+OUTPUT_DIR=/workspace/sensenova-thinking-profile-baseline \
+  bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
+
+SENSENOVA_TEXT_ATTN_BACKEND=sdpa SENSENOVA_THINK_KV_CACHE=preallocated \
+OUTPUT_DIR=/workspace/sensenova-thinking-profile-optimized \
+  bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
+```
+
+两次运行使用相同提示词、种子和 token 上限。对比 `profile/summary.json` 中的 `think_decode_ms_per_token` 和 `profile/records.json` 中相同 case/seed 的 `think_text_sha256`；散列一致表示思考文本逐字一致。两个开关也可单独切换，以拆分 SDPA 与预分配 KV 缓存各自的收益。此优化只作用于 CUDA 的思考文本解码，普通前缀和图像去噪 attention 路径保持原样。

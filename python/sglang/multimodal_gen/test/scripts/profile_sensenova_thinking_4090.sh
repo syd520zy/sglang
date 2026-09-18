@@ -37,6 +37,8 @@ trap cleanup EXIT INT TERM
   echo "steps=${STEPS}"
   echo "repeats=${REPEATS}"
   echo "budgets=${BUDGETS}"
+  echo "text_attention_backend=${SENSENOVA_TEXT_ATTN_BACKEND:-sdpa}"
+  echo "think_kv_cache=${SENSENOVA_THINK_KV_CACHE:-preallocated}"
   python -c 'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")'
   nvidia-smi
 } >"${OUTPUT_DIR}/environment.txt" 2>&1

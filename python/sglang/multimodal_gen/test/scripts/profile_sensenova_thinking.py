@@ -1,6 +1,7 @@
 """Profile SenseNova text-to-image stages with and without thinking."""
 
 import argparse
+import hashlib
 import json
 import statistics
 import time
@@ -64,6 +65,8 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
     reasoning_tokens = usage.get("reasoning_tokens", 0)
     if think_mode and not 1 <= reasoning_tokens <= max_think_tokens:
         raise ValueError(f"Invalid reasoning token count: {reasoning_tokens!r}")
+    if think_mode and not isinstance(usage.get("think_text"), str):
+        raise ValueError("Thinking text is missing from usage")
     if not think_mode and reasoning_tokens:
         raise ValueError("Thinking tokens were returned while thinking was disabled")
 
@@ -71,6 +74,11 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
         "case": f"think_{max_think_tokens}" if think_mode else "off",
         "seed": seed,
         "reasoning_tokens": reasoning_tokens,
+        "think_text_sha256": (
+            hashlib.sha256(usage["think_text"].encode("utf-8")).hexdigest()
+            if think_mode
+            else None
+        ),
         "client_elapsed_ms": round(client_elapsed_ms, 3),
         "outside_model_ms": round(client_elapsed_ms - timings["total"], 3),
         "stage_timings_ms": timings,

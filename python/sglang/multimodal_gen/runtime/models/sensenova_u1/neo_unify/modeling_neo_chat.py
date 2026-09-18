@@ -2,6 +2,7 @@
 
 import contextlib
 import math
+import os
 import time
 from typing import List, Optional, Tuple, Union
 
@@ -10,6 +11,7 @@ import transformers
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import GenerationConfig
+from transformers.cache_utils import DynamicLayer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
@@ -27,6 +29,46 @@ from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 
 logger = logging.get_logger(__name__)
+
+
+class _SenseNovaPreallocatedLayer(DynamicLayer):
+    def __init__(self, layer: DynamicLayer, capacity: int):
+        super().__init__()
+        self.dtype, self.device = layer.keys.dtype, layer.keys.device
+        self.is_initialized = True
+        length = layer.keys.shape[-2]
+        key_shape = (*layer.keys.shape[:-2], capacity, layer.keys.shape[-1])
+        value_shape = (*layer.values.shape[:-2], capacity, layer.values.shape[-1])
+        self._key_buffer = torch.empty(key_shape, dtype=self.dtype, device=self.device)
+        self._value_buffer = torch.empty(
+            value_shape, dtype=self.dtype, device=self.device
+        )
+        self._key_buffer[..., :length, :].copy_(layer.keys)
+        self._value_buffer[..., :length, :].copy_(layer.values)
+        self.keys = self._key_buffer[..., :length, :]
+        self.values = self._value_buffer[..., :length, :]
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        start = self.keys.shape[-2]
+        end = start + key_states.shape[-2]
+        if end > self._key_buffer.shape[-2]:
+            return super().update(key_states, value_states, *args, **kwargs)
+        self._key_buffer[..., start:end, :].copy_(key_states)
+        self._value_buffer[..., start:end, :].copy_(value_states)
+        self.keys = self._key_buffer[..., :end, :]
+        self.values = self._value_buffer[..., :end, :]
+        return self.keys, self.values
+
+
+def _preallocate_think_cache(cache, additional_tokens: int) -> None:
+    if not cache.layers or not all(
+        type(layer) is DynamicLayer and layer.keys is not None for layer in cache.layers
+    ):
+        return
+    for index, layer in enumerate(cache.layers):
+        cache.layers[index] = _SenseNovaPreallocatedLayer(
+            layer, layer.keys.shape[-2] + additional_tokens
+        )
 
 
 class _SenseNovaStageTimer:
@@ -662,6 +704,7 @@ class NEOChatModel(PreTrainedModel):
             attention_mask=attention_mask_dict,
             past_key_values=cache,
             use_cache=True,
+            sensenova_text_sdpa=True,
         )
         return t_idx + seq_len
 
@@ -680,6 +723,19 @@ class NEOChatModel(PreTrainedModel):
         think_token_ids = []
         think_closed = False
         next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
+        append_ids = tokenizer(
+            "\n\n" + IMG_START_TOKEN,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].to(self.device)
+        if (
+            self.device.type == "cuda"
+            and os.environ.get("SENSENOVA_THINK_KV_CACHE", "preallocated")
+            == "preallocated"
+        ):
+            _preallocate_think_cache(
+                past_key_values, max_think_tokens + append_ids.shape[1] + 1
+            )
 
         for token_index in range(max_think_tokens):
             token_item = next_token.item()
@@ -691,6 +747,7 @@ class NEOChatModel(PreTrainedModel):
                     input_ids=next_token.unsqueeze(0),
                     past_key_values=past_key_values,
                     use_cache=True,
+                    sensenova_text_sdpa=True,
                 )
                 past_key_values = outputs.past_key_values
                 t_idx += 1
@@ -709,17 +766,13 @@ class NEOChatModel(PreTrainedModel):
                 input_ids=next_token.unsqueeze(0),
                 past_key_values=past_key_values,
                 use_cache=True,
+                sensenova_text_sdpa=True,
             )
             past_key_values = outputs.past_key_values
             t_idx += 1
 
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
 
-        append_ids = tokenizer(
-            "\n\n" + IMG_START_TOKEN,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )["input_ids"].to(self.device)
         if not think_closed:
             close_ids = torch.tensor(
                 [[think_end_token_id]],

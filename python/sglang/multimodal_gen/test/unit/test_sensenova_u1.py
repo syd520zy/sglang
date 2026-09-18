@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.cache_utils import DynamicCache
 
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
@@ -42,7 +43,12 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
+    _preallocate_think_cache,
     _randn_with_seed,
+)
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+    _sdpa_text_attention,
+    eager_attention_forward,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -100,8 +106,10 @@ class _FakeThinkLanguageModel:
     def __init__(self, next_tokens):
         self.model = SimpleNamespace(current_index=None)
         self.next_tokens = list(next_tokens)
+        self.calls = []
 
     def __call__(self, *, past_key_values, **_kwargs):
+        self.calls.append(_kwargs)
         next_token = self.next_tokens.pop(0) if self.next_tokens else 0
         return SimpleNamespace(
             logits=_think_logits(next_token),
@@ -844,6 +852,53 @@ def test_sensenova_u1_thinking_always_closes_within_budget(
     assert think_text.endswith("</think>")
     assert model.last_think_token_count <= max_think_tokens
     assert appended_ids == [expected_suffix]
+    assert all(call["sensenova_text_sdpa"] for call in model.language_model.calls)
+
+
+def test_sensenova_think_cache_keeps_only_written_tokens_visible():
+    cache = DynamicCache()
+    initial_keys = torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 4)
+    initial_values = initial_keys + 100
+    cache.update(initial_keys, initial_values, 0)
+    _preallocate_think_cache(cache, additional_tokens=3)
+    layer = cache.layers[0]
+    key_buffer_ptr = layer._key_buffer.data_ptr()
+
+    assert cache.get_seq_length() == 2
+    for token in range(3):
+        keys = torch.full((1, 2, 1, 4), float(token + 20))
+        values = keys + 100
+        cache.update(keys, values, 0)
+        assert cache.get_seq_length() == 3 + token
+        assert layer._key_buffer.data_ptr() == key_buffer_ptr
+        assert layer.keys.data_ptr() == key_buffer_ptr
+        torch.testing.assert_close(layer.keys[..., -1:, :], keys)
+        torch.testing.assert_close(layer.values[..., -1:, :], values)
+
+    torch.testing.assert_close(layer.keys[..., :2, :], initial_keys)
+    torch.testing.assert_close(layer.values[..., :2, :], initial_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_length,key_length", [(1, 64), (8, 8)])
+def test_sensenova_text_sdpa_matches_eager_gqa(query_length, key_length):
+    torch.manual_seed(42)
+    device = "cuda"
+    query = torch.randn(1, 4, query_length, 64, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 2, key_length, 64, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 2, key_length, 64, device=device, dtype=torch.bfloat16)
+    mask = torch.zeros(1, 1, query_length, key_length, device=device)
+    if query_length > 1:
+        row, col = torch.triu_indices(query_length, key_length, offset=1)
+        mask[0, 0, row, col] = float("-inf")
+    module = SimpleNamespace(num_key_value_groups=2, training=False)
+
+    expected, _ = eager_attention_forward(
+        module, query, key, value, mask, scaling=0.125
+    )
+    actual = _sdpa_text_attention(query, key, value, mask, scaling=0.125)
+
+    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
