@@ -376,6 +376,7 @@ def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
         "t_eps": 0.02,
         "think_mode": False,
         "max_think_tokens": DEFAULT_MAX_THINK_TOKENS,
+        "profile_stages": False,
     }
 
 
