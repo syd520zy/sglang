@@ -8,10 +8,14 @@ server again; this script owns the per-phase assertions and writes the evidence:
               SRT log is a file of its own.
   after-kill  the first request either falls back or fails loudly (strict), one
               clear error is logged, later requests do not wait on SRT again.
+  srt-pid     print the pid listening on the SRT port, so the runner can break
+              that service and later check whether the port was released.
 """
 
 import argparse
+import glob
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +32,55 @@ BACKEND_ERROR_MARKERS = (
     "SenseNova thinking backend unavailable",
     "SenseNova thinking backend could not be started",
 )
+
+PROC_NET_TCP_FILES = ("/proc/net/tcp", "/proc/net/tcp6")
+LISTEN_STATE = "0A"
+
+
+def listening_socket_inodes(port, proc_net_tcp=PROC_NET_TCP_FILES):
+    """Socket inodes in LISTEN state on a local port, read from /proc/net/tcp."""
+    inodes = set()
+    for path in proc_net_tcp:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                rows = handle.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            if len(fields) < 10 or fields[3] != LISTEN_STATE:
+                continue
+            local_address = fields[1]
+            if ":" not in local_address:
+                continue
+            if int(local_address.rsplit(":", 1)[1], 16) != port:
+                continue
+            inodes.add(fields[9])
+    return inodes
+
+
+def find_listening_pid(port, proc_root="/proc"):
+    """The pid that owns a listening socket on this port, or None.
+
+    Reads /proc directly instead of shelling out to ss or lsof, which are not
+    installed everywhere the lifecycle runner has to work.
+    """
+    inodes = listening_socket_inodes(port)
+    if not inodes:
+        return None
+    for pid_dir in glob.glob(os.path.join(proc_root, "[0-9]*")):
+        try:
+            descriptors = os.listdir(os.path.join(pid_dir, "fd"))
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(os.path.join(pid_dir, "fd", descriptor))
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target[8:-1] in inodes:
+                return int(os.path.basename(pid_dir))
+    return None
 
 
 def resolve_base_url(raw_url, allowed_hosts):
@@ -290,10 +343,13 @@ def write_report(args, output_dir, name, checks, evidence):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--phase", choices=("info", "startup", "after-kill"), required=True
+        "--phase",
+        choices=("info", "startup", "after-kill", "srt-pid"),
+        required=True,
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--allowed-host", action="append", default=[])
     parser.add_argument("--server-log", type=Path, default=None)
     parser.add_argument("--model", default="sensenova/SenseNova-U1.5-8B-MoT")
@@ -318,6 +374,16 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.phase == "srt-pid":
+        if args.port is None:
+            parser.error("--port is required for phase srt-pid")
+        pid = find_listening_pid(args.port)
+        if pid is not None:
+            print(pid)
+        return 0 if pid is not None else 1
+
+    if not args.base_url:
+        parser.error(f"--base-url is required for phase {args.phase}")
     allowed_hosts = tuple(DEFAULT_ALLOWED_HOSTS) + tuple(args.allowed_host)
     args.base_url = resolve_base_url(args.base_url, allowed_hosts)
     args.output_dir.mkdir(parents=True, exist_ok=True)

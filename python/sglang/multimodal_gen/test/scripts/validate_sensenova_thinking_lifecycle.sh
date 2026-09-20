@@ -81,15 +81,11 @@ wait_for_gpu_memory_release() {
   return 1
 }
 
-# Returns the pid listening on a port, or an empty string.
+# Returns the pid listening on a port, or an empty string. The lookup reads
+# /proc inside the validator, so it does not depend on ss or lsof being present.
 listening_pid_on_port() {
-  local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -ltnpH "sport = :${port}" 2>/dev/null |
-      sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | head -n 1
-  elif command -v lsof >/dev/null 2>&1; then
-    lsof -ti "tcp:${port}" -sTCP:LISTEN 2>/dev/null | head -n 1
-  fi
+  python "${VALIDATOR}" --phase srt-pid --port "$1" \
+    --output-dir "${OUTPUT_DIR}" 2>/dev/null || true
 }
 
 run_mode() {
@@ -165,6 +161,7 @@ PY
   SRT_PID="$(listening_pid_on_port "${srt_port}")"
   if [[ -z "${SRT_PID}" ]]; then
     echo "no process listens on the SRT port ${srt_port}; cannot break the backend" >&2
+    echo "server pid ${SERVER_PID} children: $(pgrep -P "${SERVER_PID}" | paste -sd, -)" >&2
     return 1
   fi
   echo "=== ${mode}: internal SRT pid ${SRT_PID} on port ${srt_port}; mode ${SRT_FAILURE}"
@@ -245,6 +242,9 @@ for mode in ${MODES}; do
     echo "${mode}: FAILED"
     status=1
   fi
+  # A mode that bailed out early must not leave its server behind, or the next
+  # mode waits for GPU memory that this one still holds.
+  cleanup
 done
 
 echo "Results: ${OUTPUT_DIR}"
