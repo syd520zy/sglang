@@ -64,11 +64,8 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         thinking_backend = None
         if server_args.srt_encoder_url is not None:
-            thinking_backend = SRTThinkingClient(
-                server_args.srt_encoder_url,
-                server_args.srt_encoder_connect_timeout,
-                server_args.srt_encoder_timeout,
-            )
+            # Track the shared backend state so failures reach /server_info.
+            thinking_backend = SRTThinkingClient.for_server_args(server_args)
         self.add_stage(InputValidationStage())
         self.add_stage(
             SenseNovaU1GenerationStage(

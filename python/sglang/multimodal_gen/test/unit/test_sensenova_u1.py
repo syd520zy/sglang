@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import contextlib
 import json
+import logging
+import os
 import time
 from collections import deque
 from types import SimpleNamespace
 
 import pytest
+import requests
 import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
@@ -39,6 +43,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1 import srt_thinking
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
@@ -66,8 +71,16 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     position_ids_from_indexes,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
+    ManagedSRTThinkingServer,
     SRTThinkingClient,
+    ThinkingBackendStatus,
+    checked_dir,
+    checked_name,
+    contained_path,
     normalize_thinking_output_ids,
+    runtime_files,
+    thinking_backend_info,
+    thinking_strict_enabled,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -1426,6 +1439,181 @@ def test_sensenova_srt_thinking_client_uses_token_api(monkeypatch):
         },
         "timeout": (3, 90),
     }
+
+
+class _DeadSRTProcess:
+    """Stands in for an SRT subprocess that exited before it served."""
+
+    pid = 4242
+    exitcode = 1
+
+    def start(self):
+        pass
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        pass
+
+
+class _RecordingHandler(logging.Handler):
+    """Collects the backend logger's own records, whatever the root config is."""
+
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _capture_thinking_log():
+    handler = _RecordingHandler()
+    srt_thinking.logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        srt_thinking.logger.removeHandler(handler)
+
+
+def _thinking_status(tmp_path, *, strict, url="http://127.0.0.1:1234"):
+    return ThinkingBackendStatus(
+        url,
+        strict=strict,
+        runtime_dir=str(tmp_path),
+        status_name="srt-thinking-test.json",
+        log_name="srt-thinking-test.log",
+    )
+
+
+def _refuse_connection(*args, **kwargs):
+    raise requests.ConnectionError("connection refused")
+
+
+def test_sensenova_thinking_status_records_failure_once(tmp_path, monkeypatch):
+    monkeypatch.setattr("requests.get", _refuse_connection)
+    status = _thinking_status(tmp_path, strict=False)
+    with _capture_thinking_log() as handler:
+        assert not ManagedSRTThinkingServer(
+            process=_DeadSRTProcess(), url="http://127.0.0.1:1234", status=status
+        ).start()
+        # The client reports the same failure on every later request, but the
+        # operator only needs to read it once.
+        assert status.mark_unavailable("ConnectionError: refused") is False
+
+    state = json.loads((tmp_path / "srt-thinking-test.json").read_text())
+    assert state["state"] == "fallback"
+    assert state["backend"] == "native"
+    assert "exited with code 1" in state["reason"]
+    assert len(handler.messages) == 1
+    assert "exited with code 1" in handler.messages[0]
+
+
+def test_sensenova_thinking_strict_mode_stops_instead_of_falling_back(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("requests.get", _refuse_connection)
+    status = _thinking_status(tmp_path, strict=True)
+
+    with pytest.raises(RuntimeError, match="requires SRT"):
+        ManagedSRTThinkingServer(
+            process=_DeadSRTProcess(), url="http://127.0.0.1:1234", status=status
+        ).start()
+
+    state = json.loads((tmp_path / "srt-thinking-test.json").read_text())
+    assert state["state"] == "failed"
+    assert state["backend"] == "native"
+    assert state["strict"] is True
+
+
+def test_sensenova_thinking_client_never_retries_a_dead_backend(tmp_path, monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr("requests.post", post)
+    status = _thinking_status(tmp_path, strict=False)
+    status.mark_ready()
+    client = SRTThinkingClient("http://127.0.0.1:1234", 3, 90, status=status)
+
+    assert client.available
+    with _capture_thinking_log() as handler:
+        with pytest.raises(requests.ConnectionError):
+            client.generate(
+                [1], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+            )
+        assert not client.available
+        assert status.snapshot()["state"] == "fallback"
+
+        with pytest.raises(RuntimeError, match="unavailable"):
+            client.generate(
+                [1], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+            )
+
+    assert calls == ["http://127.0.0.1:1234/generate"]
+    assert len(handler.messages) == 1
+    assert "ConnectionError: connection refused" in handler.messages[0]
+
+
+def test_sensenova_thinking_backend_info_reports_the_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("SGLANG_SENSENOVA_THINKING_LOG_FILE", raising=False)
+    monkeypatch.delenv("SGLANG_SENSENOVA_THINKING_STRICT", raising=False)
+    # thinking_backend_info matches the pipeline config by class name.
+    pipeline_config = type("SenseNovaU1PipelineConfig", (), {})()
+    url = "http://127.0.0.1:1234"
+
+    server_args = SimpleNamespace(pipeline_config=pipeline_config, srt_encoder_url=None)
+    assert thinking_backend_info(server_args) == {
+        "state": "disabled",
+        "backend": "native",
+        "url": None,
+        "strict": False,
+        "reason": "SGLANG_SENSENOVA_THINKING_BACKEND=native",
+        "log_file": None,
+    }
+    assert (
+        thinking_backend_info(SimpleNamespace(pipeline_config=SimpleNamespace()))
+        is None
+    )
+
+    server_args.srt_encoder_url = url
+    assert thinking_backend_info(server_args)["state"] == "starting"
+
+    ThinkingBackendStatus.for_url(url).mark_ready()
+    info = thinking_backend_info(server_args)
+    assert info["state"] == "ready"
+    assert info["backend"] == "srt"
+    assert info["log_file"].startswith(str(tmp_path))
+
+
+def test_sensenova_thinking_runtime_files_never_escape_the_directory(tmp_path):
+    root, status_name, log_name = runtime_files("http://127.0.0.1:1234")
+
+    assert status_name.endswith(".json")
+    assert log_name.endswith(".log")
+    assert status_name != log_name
+    assert contained_path(root, log_name).startswith(root)
+    assert contained_path(str(tmp_path), log_name) == str(tmp_path / log_name)
+
+    for unsafe in ("../srt.log", "nested/srt.log", "nested\\srt.log", "", os.pardir):
+        with pytest.raises(ValueError):
+            checked_name(unsafe)
+    with pytest.raises(ValueError):
+        checked_dir(os.path.join(str(tmp_path), os.pardir, "elsewhere"))
+
+
+def test_sensenova_thinking_strict_mode_reads_the_environment(monkeypatch):
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_STRICT", value)
+        assert thinking_strict_enabled()
+    for value in ("", "0", "false", "off"):
+        monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_STRICT", value)
+        assert not thinking_strict_enabled()
 
 
 def test_sensenova_srt_loads_only_understanding_weights():

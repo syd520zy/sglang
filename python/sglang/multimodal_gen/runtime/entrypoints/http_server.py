@@ -209,13 +209,23 @@ async def server_info_endpoint(request: Request):
     """
     server_args: ServerArgs = request.app.state.server_args
 
-    return {
+    info = {
         "model_path": server_args.model_path,
         "served_model_name": server_args.served_model_name,
         "tp_size": server_args.tp_size,
         "dp_size": server_args.dp_size,
         "version": __version__,
     }
+
+    # Imported here because the model package pulls in the heavy runtime.
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
+        thinking_backend_info,
+    )
+
+    thinking_backend = thinking_backend_info(server_args)
+    if thinking_backend is not None:
+        info["thinking_backend"] = thinking_backend
+    return info
 
 
 @health_router.get("/model_info")

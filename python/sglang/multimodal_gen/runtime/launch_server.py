@@ -133,6 +133,16 @@ def shutdown_scheduler_processes(
     _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
+def shutdown_managed_thinking_server(managed_thinking_server) -> None:
+    """Reclaim the internal SRT subprocess so no thinking worker is left behind."""
+    if managed_thinking_server is None:
+        return
+    try:
+        managed_thinking_server.shutdown()
+    except Exception:
+        logger.exception("SenseNova internal SRT thinking backend could not be stopped")
+
+
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     """
     Args:
@@ -142,13 +152,19 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     configure_logger(server_args)
 
     managed_thinking_server = None
+    thinking_strict = False
     try:
         from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
             prepare_managed_srt_thinking,
+            thinking_strict_enabled,
         )
 
+        thinking_strict = thinking_strict_enabled()
         managed_thinking_server = prepare_managed_srt_thinking(server_args)
     except Exception:
+        if thinking_strict:
+            # Strict mode exists so a benchmark never silently measures native.
+            raise
         logger.exception(
             "SenseNova managed SRT thinking backend could not be prepared; "
             "using the native fallback"
@@ -229,6 +245,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         try:
             managed_thinking_server.start()
         except Exception:
+            if thinking_strict:
+                raise
             logger.exception(
                 "SenseNova managed SRT thinking backend could not be started; "
                 "requests will use the native fallback"
@@ -248,6 +266,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                 p.join()
         finally:
             shutdown_scheduler_processes(None, processes, request_shutdown=False)
+            shutdown_managed_thinking_server(managed_thinking_server)
         return processes
 
     if launch_http_server:
@@ -272,6 +291,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                 launch_http_server_only(server_args)
             finally:
                 shutdown_scheduler_processes(server_args, processes)
+                shutdown_managed_thinking_server(managed_thinking_server)
 
     return processes
 

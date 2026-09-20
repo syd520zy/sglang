@@ -2691,10 +2691,16 @@ class NEOChatModel(PreTrainedModel):
                     self.last_thinking_backend = "srt"
                     used_srt = True
                 except Exception as exc:
-                    thinking_backend.available = False
-                    logger.warning(
-                        "SenseNova SRT thinking failed; using native decode: %s", exc
-                    )
+                    first_failure = thinking_backend.fail(exc)
+                    if thinking_backend.strict:
+                        # Benchmarks and CI require SRT; never measure the fallback.
+                        raise
+                    if first_failure:
+                        logger.warning(
+                            "SenseNova SRT thinking is unavailable; this and later "
+                            "requests use the native decode: %s",
+                            exc,
+                        )
 
             if not used_srt:
                 outputs_condition = self._think_prefix_forward(
