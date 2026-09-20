@@ -13,8 +13,28 @@ cd /workspace/sglang
 bash benchmark/sensenova/update_repo.sh
 ```
 
-脚本会检查工作区是否干净、拉取 `feat/sensenova-thinking-mode`、打印当前 commit，并核对
-`torch`/CUDA/GPU 以及源码要求的 `sglang-kernel==0.4.7`。它只做 `--ff-only` 更新，不会覆盖本地修改。
+脚本会在工作区有**已跟踪**改动时拒绝更新（未跟踪的结果目录只列出、不阻塞），拉取
+`feat/sensenova-thinking-mode`、打印当前 commit，并核对 `torch`/CUDA/GPU 以及源码要求的
+`sglang-kernel==0.4.7`。它只做 `--ff-only` 更新，不会覆盖本地修改。
+
+## 1.5 重建结果目录（旧数据不可用时）
+
+早期运行使用了脚本的默认输出路径，结果目录落在仓库内部。要整批重跑时：
+
+```bash
+cd /workspace/sglang
+bash benchmark/sensenova/rebuild_sensenova_thinking_results.sh
+```
+
+脚本做三件事：把仓库里旧的 `sensenova-thinking-concurrency-compare/` 和
+`sensenova-thinking-lifecycle-results/` **移动**（不删除）到 `<结果根>/_stale/`，然后在仓库外的
+`<结果根>/<时间戳>/{lifecycle,concurrency}` 下重跑生命周期验收和并发对照，最后打印查看命令。
+默认结果根是仓库上一级目录下的 `sensenova-thinking-results/`，可用第一个参数指定。
+
+配套开关：`SKIP_LIFECYCLE=1` 或 `SKIP_CONCURRENCY=1` 只重建其中一项，`DRY_RUN=1` 只打印将要执行的
+动作而不归档、不跑测试；`MODES`、`SRT_FAILURE`、`STEPS`、`MAX_THINK_TOKENS`、`STEPS_LIST`、
+`CONCURRENCY`、`BUDGETS`、`REPEATS` 会透传给对应的脚本。结果放在仓库外时，
+`update_repo.sh` 就不会再看到这些目录。
 
 ## 2. P1-1 并发吞吐 A/B（native 对照 SRT）
 
