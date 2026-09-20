@@ -70,6 +70,19 @@ MODES=strict SRT_FAILURE=kill \
 `SRT_FAILURE=kill` 用 `kill_process_tree` 结束内部 SRT，模拟服务已经退出；`stop` 用 `SIGSTOP`
 模拟服务卡住，用于验证“后续请求不重复长时间等待不可用服务”。
 
+脚本自己找出内部 SRT 的 pid：它读 `/proc/net/tcp` 的 LISTEN 记录拿到 socket inode，再扫描
+`/proc/*/fd` 找到持有者，因此不依赖 `ss` 或 `lsof` 是否安装。手动确认端口归属可以单独调用：
+
+```bash
+cd /workspace/sglang
+
+python python/sglang/multimodal_gen/test/scripts/validate_sensenova_thinking_lifecycle.py \
+  --phase srt-pid --port <SRT 端口> --output-dir /tmp
+```
+
+它以退出码 0 表示找到了 pid（pid 打印在标准输出），1 表示没有进程监听该端口。每个模式结束后脚本
+都会停掉本次启动的主服务，即使中途失败也不会把服务留在 GPU 上，所以单次运行可以直接跑到结束。
+
 ## 4. 结果查看（不需要压缩）
 
 结果目录里都是小的 JSON 和文本，直接打印成可复制的摘要：
