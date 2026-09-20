@@ -15,6 +15,13 @@ def thinking_backends(records):
     }
 
 
+def common_prefix_length(left: str, right: str) -> int:
+    for index, (left_char, right_char) in enumerate(zip(left, right)):
+        if left_char != right_char:
+            return index
+    return min(len(left), len(right))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-dir", type=Path, required=True)
@@ -72,11 +79,53 @@ def main():
         == srt_hashes.get((case, seed))
         for case, seed in keys
     }
+    native_rows = {
+        (record["case"], record["seed"]): record
+        for record in native_records
+        if record["case"] != "off"
+    }
+    srt_rows = {
+        (record["case"], record["seed"]): record
+        for record in srt_records
+        if record["case"] != "off"
+    }
+    token_counts = {
+        f"{case}/seed-{seed}": {
+            "native": native_rows[(case, seed)]["reasoning_tokens"],
+            "srt": srt_rows[(case, seed)]["reasoning_tokens"],
+        }
+        for case, seed in keys
+        if (case, seed) in native_rows and (case, seed) in srt_rows
+    }
+    text_differences = {}
+    for case, seed in keys:
+        native_row = native_rows.get((case, seed))
+        srt_row = srt_rows.get((case, seed))
+        if (
+            native_row is None
+            or srt_row is None
+            or native_row.get("think_text") is None
+            or srt_row.get("think_text") is None
+            or text_matches[f"{case}/seed-{seed}"]
+        ):
+            continue
+        native_text = native_row["think_text"]
+        srt_text = srt_row["think_text"]
+        prefix_length = common_prefix_length(native_text, srt_text)
+        text_differences[f"{case}/seed-{seed}"] = {
+            "common_prefix_chars": prefix_length,
+            "native_chars": len(native_text),
+            "srt_chars": len(srt_text),
+            "native_from_difference": native_text[prefix_length : prefix_length + 160],
+            "srt_from_difference": srt_text[prefix_length : prefix_length + 160],
+        }
     report = {
         "native_backends": sorted(native_backends),
         "srt_backends": sorted(srt_backends),
         "all_think_text_hashes_match": all(text_matches.values()),
         "think_text_hash_matches": text_matches,
+        "reasoning_token_counts": token_counts,
+        "think_text_differences": text_differences,
         "comparisons": comparisons,
     }
     args.output.write_text(

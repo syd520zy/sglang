@@ -79,6 +79,7 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
         "seed": seed,
         "reasoning_tokens": reasoning_tokens,
         "thinking_backend": thinking_backend,
+        "think_text": usage["think_text"] if think_mode else None,
         "think_text_sha256": (
             hashlib.sha256(usage["think_text"].encode("utf-8")).hexdigest()
             if think_mode
