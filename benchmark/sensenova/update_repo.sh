@@ -26,10 +26,25 @@ if [[ "${REMOTE_URL}" != *"${EXPECTED_REMOTE_SUFFIX}" ]]; then
   echo "warning: ${REMOTE} is ${REMOTE_URL}, expected it to end with ${EXPECTED_REMOTE_SUFFIX}" >&2
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
+TRACKED_CHANGES="$(git status --porcelain --untracked-files=no)"
+if [[ -n "${TRACKED_CHANGES}" ]]; then
   echo "the worktree has local changes; commit or discard them before updating:" >&2
-  git status --short >&2
+  git status --short --untracked-files=no >&2
   exit 1
+fi
+
+# Result directories the benchmark scripts write here are untracked, not source
+# changes, so they must not block the update.
+UNTRACKED_COUNT="$(
+  git ls-files --others --exclude-standard | wc -l | tr -d ' '
+)"
+if (( UNTRACKED_COUNT > 0 )); then
+  echo "note: ${UNTRACKED_COUNT} untracked file(s) are left in place:"
+  git ls-files --others --exclude-standard -z |
+    tr '\0' '\n' | head -n 10 | sed 's/^/  /'
+  if (( UNTRACKED_COUNT > 10 )); then
+    echo "  ..."
+  fi
 fi
 
 echo "repository: ${REPO_ROOT}"
@@ -42,7 +57,11 @@ if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
 else
   git switch --track "${REMOTE}/${BRANCH}"
 fi
-git pull --ff-only "${REMOTE}" "${BRANCH}"
+if ! git pull --ff-only "${REMOTE}" "${BRANCH}"; then
+  echo "the fast-forward update failed. If git reported that an untracked file" >&2
+  echo "would be overwritten, move that file aside and run this script again." >&2
+  exit 1
+fi
 
 echo
 echo "checked out:"
