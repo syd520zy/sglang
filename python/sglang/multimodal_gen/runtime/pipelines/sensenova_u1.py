@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
     load_model_and_tokenizer,
 )
+from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
+    SRTThinkingClient,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -59,12 +62,19 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        del server_args
+        thinking_backend = None
+        if server_args.srt_encoder_url is not None:
+            thinking_backend = SRTThinkingClient(
+                server_args.srt_encoder_url,
+                server_args.srt_encoder_connect_timeout,
+                server_args.srt_encoder_timeout,
+            )
         self.add_stage(InputValidationStage())
         self.add_stage(
             SenseNovaU1GenerationStage(
                 model=self.get_module("model"),
                 tokenizer=self.get_module("tokenizer"),
+                thinking_backend=thinking_backend,
             ),
             "sensenova_u1_generation_stage",
         )

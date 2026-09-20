@@ -61,10 +61,11 @@ class SenseNovaU1GenerationOptions:
 
 
 class SenseNovaU1GenerationStage(PipelineStage):
-    def __init__(self, model: torch.nn.Module, tokenizer: Any):
+    def __init__(self, model: torch.nn.Module, tokenizer: Any, thinking_backend=None):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
+        self.thinking_backend = thinking_backend
 
     @property
     def role_affinity(self) -> RoleType:
@@ -95,6 +96,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             think_mode=options.think_mode,
             max_think_tokens=options.max_think_tokens,
             profile_stages=options.profile_stages,
+            thinking_backend=self.thinking_backend,
             seed=seed,
         )
         think_text = None
@@ -110,6 +112,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             usage.update(
                 think_text=think_text,
                 reasoning_tokens=int(getattr(self.model, "last_think_token_count", 0)),
+                thinking_backend=getattr(self.model, "last_thinking_backend", "native"),
             )
         if options.profile_stages:
             usage["stage_timings_ms"] = dict(

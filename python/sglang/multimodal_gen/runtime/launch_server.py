@@ -136,6 +136,19 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     """
     configure_logger(server_args)
 
+    managed_thinking_server = None
+    try:
+        from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
+            prepare_managed_srt_thinking,
+        )
+
+        managed_thinking_server = prepare_managed_srt_thinking(server_args)
+    except Exception:
+        logger.exception(
+            "SenseNova managed SRT thinking backend could not be prepared; "
+            "using the native fallback"
+        )
+
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
 
@@ -193,6 +206,15 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         reader.close()
 
     logger.debug("All workers are ready")
+
+    if managed_thinking_server is not None:
+        try:
+            managed_thinking_server.start()
+        except Exception:
+            logger.exception(
+                "SenseNova managed SRT thinking backend could not be started; "
+                "requests will use the native fallback"
+            )
 
     if node_rank != 0:
         # The TokenizerManager / HTTP surface lives on the node that owns

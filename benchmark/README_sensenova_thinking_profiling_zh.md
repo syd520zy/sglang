@@ -1,6 +1,6 @@
 # SenseNova 思考模式分阶段 Profiling
 
-该脚本在 RTX 4090 上启动 SenseNova 服务，并以相同提示词和种子依次测试关闭思考、64、128、256 token 四种情况。Profiling 只在请求显式传入 `profile_stages=true` 时启用，普通请求不会增加 CUDA 同步。
+单组 profiling 脚本会启动 SenseNova 服务，并以相同提示词和种子依次测试关闭思考、64、128、256 token 四种情况。Profiling 只在请求显式传入 `profile_stages=true` 时启用，普通请求不会增加 CUDA 同步。
 
 运行：
 
@@ -33,7 +33,8 @@ REPEATS=3 BUDGETS=64,128,256 OUTPUT_DIR=/workspace/sensenova-thinking-profile \
 
 - `input_prepare`：提示词编码、索引和 attention mask 构造。
 - `condition_prefill`：条件提示词 prefill。
-- `think_decode`：逐 token 思考解码及结束标记写入。
+- `think_decode`：SRT 或原生逐 token 思考解码。
+- `think_replay_prefill`：SRT 返回 token 后，主模型一次性重建条件 KV；原生路径为 0。
 - `cfg_prefill`：CFG 无条件分支 prefill。
 - `denoise_prepare`：KV 布局转换、缓存预分配和噪声初始化。
 - `denoise_loop`：全部图像去噪步骤。
@@ -41,30 +42,30 @@ REPEATS=3 BUDGETS=64,128,256 OUTPUT_DIR=/workspace/sensenova-thinking-profile \
 
 重点看 `think_decode_ms_per_token` 和 `denoise_delta_vs_off_ms`。首次 4090 测试约为 92–93 ms/token，而去噪耗时没有明显增长；优化目标是降低文本逐 token 解码耗时。
 
-对比优化前后的文本解码，分别运行：
+对比原生路径和 SRT 路径，分别运行：
 
 ```bash
-SENSENOVA_TEXT_ATTN_BACKEND=eager SENSENOVA_THINK_KV_CACHE=dynamic \
+SGLANG_SENSENOVA_THINKING_BACKEND=native \
 OUTPUT_DIR=/workspace/sensenova-thinking-profile-baseline \
   bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
 
-SENSENOVA_TEXT_ATTN_BACKEND=eager SENSENOVA_THINK_KV_CACHE=preallocated \
+SGLANG_SENSENOVA_THINKING_BACKEND=srt \
 OUTPUT_DIR=/workspace/sensenova-thinking-profile-optimized \
   bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
 ```
 
-两次运行使用相同提示词、种子和 token 上限。对比 `profile/summary.json` 中的 `think_decode_ms_per_token` 和 `profile/records.json` 中相同 case/seed 的 `think_text_sha256`；散列一致表示思考文本逐字一致。4090 交叉测试中，单独开启预分配 KV 缓存保持了 64-token 思考文本一致，单独开启 SDPA 则改变了文本且未带来速度收益。因此 CUDA 思考注意力默认使用 eager，SDPA 仅在显式设置 `SENSENOVA_TEXT_ATTN_BACKEND=sdpa` 时启用；预分配缓存仍为默认。此优化只作用于 CUDA 的思考文本解码，普通前缀和图像去噪 attention 路径保持原样。
+两次运行使用相同提示词、种子和 token 上限。先检查 `profile/records.json` 的 `thinking_backend`：优化组应为 `srt`，如果是 `native`，说明内部服务启动或调用失败，实际测试的是回退路径。确认后再对比 `profile/summary.json` 中的 `think_decode_ms_per_token`，以及相同 case/seed 的 `think_text_sha256`。SRT 子服务由主服务自动启动，调用方仍只设置 `think_mode`；`--srt-encoder-url` 仅保留为外部部署覆盖项。官方 checkpoint 总大小约 35.1 GB，内部 SRT 还需约 18 GB 的稠密文本权重，因此 24/48 GB 4090 的权重容量本身就不足；启动失败时会自动回退原生路径，验证加速应换用 80 GB GPU。
 
-下一阶段测试 MoE 单 token 分发。原路径逐个检查所有专家；实验路径只处理路由选中的 top-k 专家。实验路径默认关闭，只在 CUDA 推理且输入为单 token 时生效：
+A800 上可用对照脚本一次完成原生路径、SRT 路径及结果比较。比较阶段会校验两组实际使用的后端；SRT 发生回退时脚本会失败并提示检查 `srt/server.log`。
 
 ```bash
-BUDGETS=64,128,256 REPEATS=2 SENSENOVA_MOE_SINGLE_TOKEN_DISPATCH=all \
-OUTPUT_DIR=/workspace/sensenova-thinking-moe-baseline \
-  bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
-
-BUDGETS=64,128,256 REPEATS=2 SENSENOVA_MOE_SINGLE_TOKEN_DISPATCH=topk \
-OUTPUT_DIR=/workspace/sensenova-thinking-moe-topk \
-  bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
+REPEATS=2 BUDGETS=64,128,256 WIDTH=1024 HEIGHT=1024 \
+  bash python/sglang/multimodal_gen/test/scripts/compare_sensenova_thinking_srt_a800.sh
 ```
 
-先核对两组的单测和每个 case/seed 的 `reasoning_tokens`、`think_text_sha256`，再比较 `think_decode_ms_per_token`。如文本不一致，不应只凭耗时启用实验路径。
+压缩完整结果目录：
+
+```bash
+bash python/sglang/multimodal_gen/test/scripts/pack_sensenova_thinking_results.sh \
+  /workspace/sglang/sensenova-thinking-srt-a800-results/<时间戳>
+```

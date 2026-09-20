@@ -14,6 +14,7 @@ STAGES = (
     "input_prepare",
     "condition_prefill",
     "think_decode",
+    "think_replay_prefill",
     "cfg_prefill",
     "denoise_prepare",
     "denoise_loop",
@@ -67,6 +68,9 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
         raise ValueError(f"Invalid reasoning token count: {reasoning_tokens!r}")
     if think_mode and not isinstance(usage.get("think_text"), str):
         raise ValueError("Thinking text is missing from usage")
+    thinking_backend = usage.get("thinking_backend")
+    if think_mode and thinking_backend not in {"srt", "native"}:
+        raise ValueError(f"Invalid thinking backend: {thinking_backend!r}")
     if not think_mode and reasoning_tokens:
         raise ValueError("Thinking tokens were returned while thinking was disabled")
 
@@ -74,6 +78,7 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
         "case": f"think_{max_think_tokens}" if think_mode else "off",
         "seed": seed,
         "reasoning_tokens": reasoning_tokens,
+        "thinking_backend": thinking_backend,
         "think_text_sha256": (
             hashlib.sha256(usage["think_text"].encode("utf-8")).hexdigest()
             if think_mode
@@ -101,6 +106,9 @@ def summarize(records):
         }
         cases[name] = {
             "samples": len(rows),
+            "thinking_backends": sorted(
+                {row["thinking_backend"] for row in rows if row["thinking_backend"]}
+            ),
             "reasoning_tokens_mean": reasoning_tokens,
             "client_elapsed_ms_mean": round(
                 statistics.mean(row["client_elapsed_ms"] for row in rows), 3
@@ -206,6 +214,7 @@ def main():
                 f"think={record['stage_timings_ms']['think_decode']:.1f} ms "
                 f"denoise={record['stage_timings_ms']['denoise_loop']:.1f} ms "
                 f"tokens={record['reasoning_tokens']}",
+                f"backend={record['thinking_backend']}",
                 flush=True,
             )
 

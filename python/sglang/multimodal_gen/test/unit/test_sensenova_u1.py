@@ -35,9 +35,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
-    modeling_qwen3_moe,
-)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
     NEOVisionConfig,
 )
@@ -49,12 +46,9 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
     _preallocate_think_cache,
     _randn_with_seed,
 )
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
-    _sdpa_text_attention,
-    eager_attention_forward,
-)
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3_moe import (
-    Qwen3MoeSparseMoeBlock,
+from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
+    SRTThinkingClient,
+    normalize_thinking_output_ids,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -69,6 +63,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+from sglang.srt.models.sensenova_u1 import _understanding_weights
 
 
 class _FakeSenseNovaModel:
@@ -82,6 +77,7 @@ class _FakeSenseNovaModel:
                 "input_prepare": 1.0,
                 "condition_prefill": 2.0,
                 "think_decode": 3.0 if kwargs["think_mode"] else 0.0,
+                "think_replay_prefill": 0.0,
                 "cfg_prefill": 4.0,
                 "denoise_prepare": 5.0,
                 "denoise_loop": 6.0,
@@ -98,6 +94,9 @@ class _FakeSenseNovaModel:
         )
         if kwargs["think_mode"]:
             self.last_think_token_count = 3
+            self.last_thinking_backend = (
+                "srt" if kwargs.get("thinking_backend") is not None else "native"
+            )
             return image, "draft</think>"
         return image
 
@@ -797,18 +796,23 @@ def test_sensenova_u1_generation_stage_returns_thinking_usage():
         metrics=None,
     )
     model = _FakeSenseNovaModel()
+    thinking_backend = object()
 
-    output = SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
-        batch, server_args=SimpleNamespace()
-    )
+    output = SenseNovaU1GenerationStage(
+        model=model, tokenizer="tok", thinking_backend=thinking_backend
+    ).forward(batch, server_args=SimpleNamespace())
 
     assert model.call_kwargs["think_mode"] is True
     assert model.call_kwargs["max_think_tokens"] == 128
+    assert model.call_kwargs["thinking_backend"] is thinking_backend
     assert output.usage == {
         "think_text": "draft</think>",
         "reasoning_tokens": 3,
+        "thinking_backend": "srt",
     }
-    assert ImageUsage.model_validate(output.usage).think_text == "draft</think>"
+    usage = ImageUsage.model_validate(output.usage)
+    assert usage.think_text == "draft</think>"
+    assert usage.thinking_backend == "srt"
 
 
 @pytest.mark.parametrize(
@@ -858,7 +862,7 @@ def test_sensenova_u1_thinking_always_closes_within_budget(
     assert think_text.endswith("</think>")
     assert model.last_think_token_count <= max_think_tokens
     assert appended_ids == [expected_suffix]
-    assert all(call["sensenova_text_sdpa"] for call in model.language_model.calls)
+    assert all(call["use_cache"] for call in model.language_model.calls)
 
 
 def test_sensenova_think_cache_keeps_only_written_tokens_visible():
@@ -885,56 +889,72 @@ def test_sensenova_think_cache_keeps_only_written_tokens_visible():
     torch.testing.assert_close(layer.values[..., :2, :], initial_values)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("query_length,key_length", [(1, 64), (8, 8)])
-def test_sensenova_text_sdpa_matches_eager_gqa(query_length, key_length):
-    torch.manual_seed(42)
-    device = "cuda"
-    query = torch.randn(1, 4, query_length, 64, device=device, dtype=torch.bfloat16)
-    key = torch.randn(1, 2, key_length, 64, device=device, dtype=torch.bfloat16)
-    value = torch.randn(1, 2, key_length, 64, device=device, dtype=torch.bfloat16)
-    mask = torch.zeros(1, 1, query_length, key_length, device=device)
-    if query_length > 1:
-        row, col = torch.triu_indices(query_length, key_length, offset=1)
-        mask[0, 0, row, col] = float("-inf")
-    module = SimpleNamespace(num_key_value_groups=2, training=False)
-
-    expected, _ = eager_attention_forward(
-        module, query, key, value, mask, scaling=0.125
-    )
-    actual = _sdpa_text_attention(query, key, value, mask, scaling=0.125)
-
-    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("n_tokens", [1, 3])
-def test_sensenova_single_token_moe_dispatch_matches_all_experts(
-    monkeypatch, dtype, n_tokens
-):
-    torch.manual_seed(42)
-    config = SimpleNamespace(
-        hidden_size=32,
-        intermediate_size=64,
-        moe_intermediate_size=16,
-        hidden_act="silu",
-        num_experts=8,
-        num_experts_per_tok=2,
-        norm_topk_prob=True,
-    )
-    block = Qwen3MoeSparseMoeBlock(config).to(device="cuda", dtype=dtype).eval()
-    hidden_states = torch.randn(1, n_tokens, 32, device="cuda", dtype=dtype)
-
-    with torch.no_grad():
-        monkeypatch.setattr(
-            modeling_qwen3_moe, "_USE_TOPK_SINGLE_TOKEN_DISPATCH", False
+@pytest.mark.parametrize(
+    ("output_ids", "expected"),
+    [
+        ([7, 9, 6], [7, 9]),
+        ([7, 8, 6], [7, 9]),
+        ([7, 6, 5], [7, 6, 9]),
+    ],
+)
+def test_sensenova_srt_thinking_output_closes_within_budget(output_ids, expected):
+    assert (
+        normalize_thinking_output_ids(
+            output_ids,
+            max_think_tokens=3,
+            eos_token_id=8,
+            think_end_token_id=9,
         )
-        expected = block(hidden_states)
-        monkeypatch.setattr(modeling_qwen3_moe, "_USE_TOPK_SINGLE_TOKEN_DISPATCH", True)
-        actual = block(hidden_states)
+        == expected
+    )
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+def test_sensenova_srt_thinking_client_uses_token_api(monkeypatch):
+    request = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"output_ids": [7, 9]}
+
+    def post(url, **kwargs):
+        request.update(url=url, **kwargs)
+        return Response()
+
+    monkeypatch.setattr("requests.post", post)
+    output_ids = SRTThinkingClient("http://127.0.0.1:1234", 3, 90).generate(
+        [1, 2], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+    )
+
+    assert output_ids == [7, 9]
+    assert request == {
+        "url": "http://127.0.0.1:1234/generate",
+        "json": {
+            "input_ids": [1, 2],
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 3,
+                "stop_token_ids": [8, 9],
+                "no_stop_trim": True,
+                "skip_special_tokens": False,
+            },
+        },
+        "timeout": (3, 90),
+    }
+
+
+def test_sensenova_srt_loads_only_understanding_weights():
+    weights = [
+        ("language_model.model.layers.0.self_attn.q_proj.weight", 1),
+        ("language_model.model.layers.0.self_attn.q_proj_mot_gen.weight", 2),
+        ("fm_modules.fm_head.weight", 3),
+    ]
+
+    assert list(_understanding_weights(weights)) == [
+        ("model.layers.0.self_attn.q_proj.weight", 1)
+    ]
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():

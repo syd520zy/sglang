@@ -704,9 +704,49 @@ class NEOChatModel(PreTrainedModel):
             attention_mask=attention_mask_dict,
             past_key_values=cache,
             use_cache=True,
-            sensenova_text_sdpa=True,
         )
         return t_idx + seq_len
+
+    def _request_srt_think_tokens(
+        self,
+        tokenizer,
+        thinking_backend,
+        input_ids,
+        max_think_tokens,
+    ):
+        template = get_conv_template(self.template)
+        eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
+        think_end_token_id = tokenizer.convert_tokens_to_ids("</think>")
+        output_ids = thinking_backend.generate(
+            input_ids[0].tolist(),
+            max_think_tokens=max_think_tokens,
+            eos_token_id=eos_token_id,
+            think_end_token_id=think_end_token_id,
+        )
+        token_ids = torch.tensor(
+            [output_ids], dtype=input_ids.dtype, device=input_ids.device
+        )
+        self.last_think_token_count = len(output_ids)
+        return token_ids, tokenizer.decode(output_ids, skip_special_tokens=False)
+
+    def _replay_srt_think_prefix(
+        self, tokenizer, input_ids, think_token_ids, IMG_START_TOKEN
+    ):
+        append_ids = tokenizer(
+            "\n\n" + IMG_START_TOKEN,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].to(self.device)
+        replay_ids = torch.cat((input_ids, think_token_ids, append_ids), dim=1)
+        t_idx = torch.arange(
+            replay_ids.shape[1], dtype=torch.long, device=replay_ids.device
+        )
+        indexes = torch.stack((t_idx, torch.zeros_like(t_idx), torch.zeros_like(t_idx)))
+        attention_mask = {"full_attention": create_block_causal_mask(t_idx)}
+        cache, hidden_states = self._t2i_prefix_forward(
+            replay_ids, indexes, attention_mask
+        )
+        return cache, hidden_states, indexes
 
     def _generate_think(
         self,
@@ -747,7 +787,6 @@ class NEOChatModel(PreTrainedModel):
                     input_ids=next_token.unsqueeze(0),
                     past_key_values=past_key_values,
                     use_cache=True,
-                    sensenova_text_sdpa=True,
                 )
                 past_key_values = outputs.past_key_values
                 t_idx += 1
@@ -766,7 +805,6 @@ class NEOChatModel(PreTrainedModel):
                 input_ids=next_token.unsqueeze(0),
                 past_key_values=past_key_values,
                 use_cache=True,
-                sensenova_text_sdpa=True,
             )
             past_key_values = outputs.past_key_values
             t_idx += 1
@@ -2396,9 +2434,11 @@ class NEOChatModel(PreTrainedModel):
         seed=0,
         max_think_tokens=1024,
         profile_stages=False,
+        thinking_backend=None,
     ):
         profiler = _SenseNovaStageTimer(profile_stages, self.device)
         self.last_profile_timings_ms = {}
+        self.last_thinking_backend = None
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
         self._notify_layer_offload_phase("prefix")
@@ -2463,34 +2503,73 @@ class NEOChatModel(PreTrainedModel):
         profiler.mark("input_prepare")
 
         if think_mode:
-            outputs_condition = self._think_prefix_forward(
-                input_ids=input_ids_condition,
-                indexes=indexes_condition,
-                attention_mask=attention_mask_condition_prefix,
-            )
-            past_key_values_condition = outputs_condition.past_key_values
-            device = outputs_condition.logits.device
-            dtype = outputs_condition.logits.dtype
-            t_index_condition = indexes_condition[0].max().item()
-            profiler.mark("condition_prefill")
-            past_key_values_condition, t_index_condition, think_text = (
-                self._generate_think(
-                    tokenizer,
-                    outputs_condition,
-                    past_key_values_condition,
-                    t_index_condition,
-                    IMG_START_TOKEN,
-                    max_think_tokens=max_think_tokens,
+            used_srt = False
+            if thinking_backend is not None:
+                profiler.mark("condition_prefill")
+                try:
+                    think_token_ids, think_text = self._request_srt_think_tokens(
+                        tokenizer,
+                        thinking_backend,
+                        input_ids_condition,
+                        max_think_tokens,
+                    )
+                    profiler.mark("think_decode")
+                    (
+                        past_key_values_condition,
+                        prefix_hidden_states,
+                        indexes_condition,
+                    ) = self._replay_srt_think_prefix(
+                        tokenizer,
+                        input_ids_condition,
+                        think_token_ids,
+                        IMG_START_TOKEN,
+                    )
+                    device = prefix_hidden_states.device
+                    dtype = prefix_hidden_states.dtype
+                    t_index_condition = indexes_condition[0].max().item()
+                    del prefix_hidden_states, think_token_ids
+                    profiler.mark("think_replay_prefill")
+                    self.last_thinking_backend = "srt"
+                    used_srt = True
+                except Exception as exc:
+                    thinking_backend.available = False
+                    logger.warning(
+                        "SenseNova SRT thinking failed; using native decode: %s", exc
+                    )
+
+            if not used_srt:
+                outputs_condition = self._think_prefix_forward(
+                    input_ids=input_ids_condition,
+                    indexes=indexes_condition,
+                    attention_mask=attention_mask_condition_prefix,
                 )
-            )
-            profiler.mark("think_decode")
+                past_key_values_condition = outputs_condition.past_key_values
+                device = outputs_condition.logits.device
+                dtype = outputs_condition.logits.dtype
+                t_index_condition = indexes_condition[0].max().item()
+                profiler.mark("condition_prefill")
+                past_key_values_condition, t_index_condition, think_text = (
+                    self._generate_think(
+                        tokenizer,
+                        outputs_condition,
+                        past_key_values_condition,
+                        t_index_condition,
+                        IMG_START_TOKEN,
+                        max_think_tokens=max_think_tokens,
+                    )
+                )
+                profiler.mark("think_decode")
+                self.last_thinking_backend = "native"
+                if profile_stages:
+                    profiler.timings_ms["think_replay_prefill"] = 0.0
             indexes_image_condition = self._build_t2i_image_indexes(
                 token_h,
                 token_w,
                 t_index_condition + 1,
                 device=input_ids_condition.device,
             )
-            del outputs_condition
+            if not used_srt:
+                del outputs_condition
         else:
             past_key_values_condition, prefix_hidden_states = self._t2i_prefix_forward(
                 input_ids_condition, indexes_condition, attention_mask_condition_prefix
@@ -2501,6 +2580,7 @@ class NEOChatModel(PreTrainedModel):
             profiler.mark("condition_prefill")
             if profile_stages:
                 profiler.timings_ms["think_decode"] = 0.0
+                profiler.timings_ms["think_replay_prefill"] = 0.0
         past_key_values_uncondition = None
         if input_ids_uncondition is not None:
             past_key_values_uncondition, _ = self._t2i_prefix_forward(

@@ -334,6 +334,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "NEOChatModel",
     )
 
     # The attention-backend allow-list is enforced via
