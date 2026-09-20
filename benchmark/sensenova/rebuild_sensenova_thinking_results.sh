@@ -63,11 +63,10 @@ if [[ -n "${DRY_RUN:-}" ]]; then
   exit 0
 fi
 
-mkdir -p "${OUT}/lifecycle" "${OUT}/concurrency"
-
 status=0
 if [[ -z "${SKIP_LIFECYCLE:-}" ]]; then
   echo "=== lifecycle acceptance (${MODES}) ==="
+  mkdir -p "${OUT}/lifecycle"
   MODES="${MODES}" SRT_FAILURE="${SRT_FAILURE}" STEPS="${STEPS}" \
   MAX_THINK_TOKENS="${MAX_THINK_TOKENS}" OUTPUT_DIR="${OUT}/lifecycle" \
     bash "${LIFECYCLE}" || status=1
@@ -75,17 +74,27 @@ else
   echo "=== lifecycle acceptance skipped (SKIP_LIFECYCLE=1) ==="
 fi
 
-if [[ -z "${SKIP_CONCURRENCY:-}" ]] && (( status == 0 )); then
+if [[ -n "${SKIP_CONCURRENCY:-}" ]]; then
+  echo "=== concurrency comparison skipped (SKIP_CONCURRENCY=1) ==="
+elif (( status != 0 )); then
+  echo
+  echo "the lifecycle check did not pass, so no comparison was run: a GPU that" >&2
+  echo "cannot pass it will not produce a usable A/B either." >&2
+else
   echo
   echo "=== concurrency comparison (steps=${STEPS_LIST}) ==="
+  mkdir -p "${OUT}/concurrency"
   STEPS_LIST="${STEPS_LIST}" CONCURRENCY="${CONCURRENCY}" BUDGETS="${BUDGETS}" \
   REPEATS="${REPEATS}" OUTPUT_DIR="${OUT}/concurrency" \
-    bash "${CONCURRENCY}"
-elif [[ -n "${SKIP_CONCURRENCY:-}" ]]; then
-  echo "=== concurrency comparison skipped (SKIP_CONCURRENCY=1) ==="
+    bash "${CONCURRENCY}" || status=1
 fi
 
 echo
+if (( status != 0 )); then
+  echo "nothing usable was written to ${OUT}; see the output above." >&2
+  exit 1
+fi
+
 echo "results: ${OUT}"
 echo
 echo "read them with:"
