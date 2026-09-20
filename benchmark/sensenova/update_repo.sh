@@ -41,7 +41,7 @@ UNTRACKED_COUNT="$(
 if (( UNTRACKED_COUNT > 0 )); then
   echo "note: ${UNTRACKED_COUNT} untracked file(s) are left in place:"
   git ls-files --others --exclude-standard -z |
-    tr '\0' '\n' | head -n 10 | sed 's/^/  /'
+    tr '\0' '\n' | awk 'NR <= 10 {print "  " $0}'
   if (( UNTRACKED_COUNT > 10 )); then
     echo "  ..."
   fi

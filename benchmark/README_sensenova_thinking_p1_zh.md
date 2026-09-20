@@ -33,13 +33,18 @@ bash benchmark/sensenova/rebuild_sensenova_thinking_results.sh
 
 配套开关：`SKIP_LIFECYCLE=1` 或 `SKIP_CONCURRENCY=1` 只重建其中一项，`DRY_RUN=1` 只打印将要执行的
 动作而不归档、不跑测试；`MODES`、`SRT_FAILURE`、`STEPS`、`MAX_THINK_TOKENS`、`STEPS_LIST`、
-`CONCURRENCY`、`BUDGETS`、`REPEATS` 会透传给对应的脚本。结果放在仓库外时，
+`SRT_TIMEOUT_MS`、`CONCURRENCY`、`BUDGETS`、`REPEATS` 会透传给对应的脚本。结果放在仓库外时，
 `update_repo.sh` 就不会再看到这些目录。
 
 ## 2. P1-1 并发吞吐 A/B（native 对照 SRT）
 
 一次运行完成 native 基线、SRT 优化路径和比较，输出 `comparison.json`。`STEPS_LIST` 是要逐一的
 去噪步数列表，每一项都会重启一对服务：
+
+`parallelism_ratio` 使用服务端 `stage_timings_ms.total` 推算的模型执行窗口计算。两个客户端即使
+同时发出请求，只要模型按顺序执行，该值仍接近 1；并发 2 的模型窗口真正重叠时才会接近 2。
+对照脚本会为 SRT 侧自动启用 strict 模式；SRT 启动或运行失败时本轮直接失败，不会生成可误用的
+native fallback 性能数据。
 
 ```bash
 cd /workspace/sglang
@@ -89,6 +94,8 @@ MODES=strict SRT_FAILURE=kill \
 
 `SRT_FAILURE=kill` 用 `kill_process_tree` 结束内部 SRT，模拟服务已经退出；`stop` 用 `SIGSTOP`
 模拟服务卡住，用于验证“后续请求不重复长时间等待不可用服务”。
+`SRT_TIMEOUT_MS` 默认 100000；脚本会把它换算后传给服务的 `--srt-encoder-timeout`，因此缩短该值会
+同时缩短真实读超时和验收阈值。该值必须是整秒对应的正整数毫秒数，例如 `10000`。
 
 脚本自己找出内部 SRT 的 pid：它读 `/proc/net/tcp` 的 LISTEN 记录拿到 socket inode，再扫描
 `/proc/*/fd` 找到持有者，因此不依赖 `ss` 或 `lsof` 是否安装。手动确认端口归属可以单独调用：
@@ -102,6 +109,7 @@ python python/sglang/multimodal_gen/test/scripts/validate_sensenova_thinking_lif
 
 它以退出码 0 表示找到了 pid（pid 打印在标准输出），1 表示没有进程监听该端口。每个模式结束后脚本
 都会停掉本次启动的主服务，即使中途失败也不会把服务留在 GPU 上，所以单次运行可以直接跑到结束。
+退出检查会同时比较 SRT 端口和运行前后的 GPU compute pid；任一项残留都会让脚本非零退出。
 
 ## 4. 结果查看（不需要压缩）
 
@@ -129,14 +137,14 @@ bash python/sglang/multimodal_gen/test/scripts/pack_sensenova_thinking_results.s
 P1-1（`compare_sensenova_thinking_concurrency.sh`）：
 
 - `native/`、`srt/`：两次运行的 `environment.txt`、`server.log`、`batch-metrics.log`、
-  `profile/records.json`、`profile/summary.json`。
+  `records.json`、`summary.json`；SRT 侧的状态文件和内部日志保存在 `thinking-runtime/`。
 - `comparison.json`、`comparison.log`：两组对照和判定项。
 
 P1-3（`validate_sensenova_thinking_lifecycle.sh`）：
 
 - `<mode>/environment.txt`：commit、模式、strict、失败注入方式、基线 GPU 进程。
 - `<mode>/server.log`：主服务日志；内部 SRT 的日志在单独文件里，路径见
-  `/server_info` 的 `thinking_backend.log_file`。
+  `/server_info` 的 `thinking_backend.log_file`，并随结果保存在 `<mode>/thinking-runtime/`。
 - `<mode>/server-info.json`：启动后的 `/server_info`，含 `thinking_backend` 字段。
 - `<mode>/lifecycle-startup.json`、`<mode>/lifecycle-after-kill.json`：每个检查项及其证据。
 - `<mode>/residue.txt`：退出后 SRT 端口是否仍在监听、GPU 计算进程是否清空。

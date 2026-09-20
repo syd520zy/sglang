@@ -246,6 +246,10 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             managed_thinking_server.start()
         except Exception:
             if thinking_strict:
+                # Workers already hold the main model at this point. A strict
+                # startup failure must release them before it leaves launch_server.
+                shutdown_scheduler_processes(None, processes, request_shutdown=False)
+                shutdown_managed_thinking_server(managed_thinking_server)
                 raise
             logger.exception(
                 "SenseNova managed SRT thinking backend could not be started; "

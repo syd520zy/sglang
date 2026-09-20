@@ -1023,6 +1023,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.noise_pred, start, end, total_items
                 ),
                 peak_memory_mb=output_batch.peak_memory_mb,
+                # Stage profiling and model-specific response metadata belong
+                # on every response produced from the merged execution.
+                usage=deepcopy(output_batch.usage),
             )
             if split.metrics is not None:
                 split.metrics.request_id = req.request_id

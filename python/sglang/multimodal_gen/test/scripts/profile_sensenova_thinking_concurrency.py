@@ -216,10 +216,19 @@ def think_window_ms(record):
     timings = record.get("stage_timings_ms")
     if not timings or not timings.get("think_decode"):
         return None
-    thought_at = record["start_offset_ms"] + sum(
-        timings[stage] for stage in STAGES_BEFORE_THINK
-    )
+    # Concurrent clients start together even when the scheduler executes them
+    # serially. Anchor the server work at response completion so queueing time
+    # is not mistaken for overlapping model execution.
+    model_started_at = record["end_offset_ms"] - timings["total"]
+    thought_at = model_started_at + sum(timings[stage] for stage in STAGES_BEFORE_THINK)
     return thought_at, thought_at + timings["think_decode"]
+
+
+def model_window_ms(record):
+    timings = record.get("stage_timings_ms")
+    if not timings:
+        return None
+    return record["end_offset_ms"] - timings["total"], record["end_offset_ms"]
 
 
 def pair_overlap_ms(left, right):
@@ -241,8 +250,16 @@ def summarize_wave(records):
     if not ok:
         return summary
 
-    busy_ms = sum(record["client_elapsed_ms"] for record in ok)
-    summary["parallelism_ratio"] = round(busy_ms / wall_ms, 3)
+    model_windows = [model_window_ms(record) for record in ok]
+    model_windows = [window for window in model_windows if window is not None]
+    if model_windows:
+        model_wall_ms = max(window[1] for window in model_windows) - min(
+            window[0] for window in model_windows
+        )
+        model_busy_ms = sum(window[1] - window[0] for window in model_windows)
+        summary["parallelism_ratio"] = round(
+            model_busy_ms / max(model_wall_ms, 1e-9), 3
+        )
     summary["latency_ms"] = {
         "mean": round(statistics.mean(r["client_elapsed_ms"] for r in ok), 3),
         "p50": round(percentile([r["client_elapsed_ms"] for r in ok], 50.0), 3),

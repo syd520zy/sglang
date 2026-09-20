@@ -95,6 +95,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+from sglang.multimodal_gen.test.scripts.profile_sensenova_thinking_concurrency import (
+    summarize_wave,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.models.sensenova_u1 import _understanding_weights
 
@@ -895,6 +898,7 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
         OutputBatch(
             output=[torch.tensor([7]), torch.tensor([19])],
             output_file_paths=expected_paths,
+            usage={"stage_timings_ms": {"total": 12.5}},
         ),
         requests,
     )
@@ -902,6 +906,11 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     assert [output.output_file_paths for output in outputs] == [
         [path] for path in expected_paths
     ]
+    assert [output.usage for output in outputs] == [
+        {"stage_timings_ms": {"total": 12.5}},
+        {"stage_timings_ms": {"total": 12.5}},
+    ]
+    assert outputs[0].usage is not outputs[1].usage
     assert (
         scheduler._split_batched_output(
             OutputBatch(output=[torch.tensor([7])]), requests
@@ -911,6 +920,38 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     requests[1].sampling_params.width = 1024
     del requests[1]._dynamic_batch_sig
     assert scheduler._try_merge_generation_reqs(requests) is None
+
+
+def test_sensenova_thinking_concurrency_summary_does_not_count_queueing_as_overlap():
+    def record(request_index, completed_at, total_ms):
+        timings = {
+            stage: 0.0
+            for stage in (
+                "input_prepare",
+                "condition_prefill",
+                "think_decode",
+                "think_replay_prefill",
+                "cfg_prefill",
+                "denoise_prepare",
+                "denoise_loop",
+                "total",
+            )
+        }
+        timings["total"] = total_ms
+        return {
+            "request_index": request_index,
+            "start_offset_ms": 0.0,
+            "end_offset_ms": completed_at,
+            "client_elapsed_ms": completed_at,
+            "stage_timings_ms": timings,
+        }
+
+    serial = summarize_wave([record(0, 1000.0, 1000.0), record(1, 2000.0, 1000.0)])
+    parallel = summarize_wave([record(0, 1000.0, 1000.0), record(1, 1000.0, 1000.0)])
+
+    assert serial["parallelism_ratio"] == 1.0
+    assert not serial.get("think_window_overlap_pairs")
+    assert parallel["parallelism_ratio"] == 2.0
 
 
 def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
@@ -1457,6 +1498,11 @@ class _DeadSRTProcess:
         pass
 
 
+class _UnstartableSRTProcess(_DeadSRTProcess):
+    def start(self):
+        raise OSError("spawn failed")
+
+
 class _RecordingHandler(logging.Handler):
     """Collects the backend logger's own records, whatever the root config is."""
 
@@ -1528,6 +1574,20 @@ def test_sensenova_thinking_strict_mode_stops_instead_of_falling_back(
     assert state["strict"] is True
 
 
+def test_sensenova_thinking_records_a_process_spawn_failure(tmp_path):
+    status = _thinking_status(tmp_path, strict=False)
+
+    assert not ManagedSRTThinkingServer(
+        process=_UnstartableSRTProcess(),
+        url="http://127.0.0.1:1234",
+        status=status,
+    ).start()
+
+    state = json.loads((tmp_path / "srt-thinking-test.json").read_text())
+    assert state["state"] == "fallback"
+    assert "OSError: spawn failed" in state["reason"]
+
+
 def test_sensenova_thinking_client_never_retries_a_dead_backend(tmp_path, monkeypatch):
     calls = []
 
@@ -1557,6 +1617,33 @@ def test_sensenova_thinking_client_never_retries_a_dead_backend(tmp_path, monkey
     assert calls == ["http://127.0.0.1:1234/generate"]
     assert len(handler.messages) == 1
     assert "ConnectionError: connection refused" in handler.messages[0]
+
+
+def test_sensenova_thinking_client_observes_parent_startup_failure(
+    tmp_path, monkeypatch
+):
+    url = "http://127.0.0.1:1234"
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("SGLANG_SENSENOVA_THINKING_LOG_FILE", raising=False)
+    monkeypatch.delenv("SGLANG_SENSENOVA_THINKING_STRICT", raising=False)
+    client = SRTThinkingClient(url, 3, 90, status=ThinkingBackendStatus.for_url(url))
+    parent_status = ThinkingBackendStatus.for_url(url)
+    parent_status.mark_unavailable("the internal SRT process exited")
+
+    def unexpected_post(*args, **kwargs):
+        raise AssertionError("the client must not call a backend already marked failed")
+
+    monkeypatch.setattr("requests.post", unexpected_post)
+    with _capture_thinking_log() as handler:
+        with pytest.raises(RuntimeError, match="unavailable"):
+            client.generate(
+                [1], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+            )
+        assert client.fail(RuntimeError("unavailable")) is False
+
+    assert not client.available
+    assert client.status.state.value == "fallback"
+    assert handler.messages == []
 
 
 def test_sensenova_thinking_backend_info_reports_the_state(tmp_path, monkeypatch):

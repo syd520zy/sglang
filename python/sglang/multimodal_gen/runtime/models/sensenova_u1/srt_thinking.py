@@ -33,7 +33,7 @@ class ThinkingBackendState(str, Enum):
     disabled: thinking uses the native decode by configuration.
     starting: the SRT subprocess is spawned, its HTTP surface is not confirmed yet.
     ready: SRT answers, thinking requests are served by it.
-    failed: SRT is required (strict mode) and unusable, so the server stops.
+    failed: SRT is required (strict mode) and unusable, so requests fail.
     fallback: SRT is unusable and not required, so thinking uses the native decode.
     stopped: the subprocess was reclaimed on shutdown.
     """
@@ -152,6 +152,18 @@ class ThinkingBackendStatus:
         except (KeyError, ValueError):
             return
         self.reason = str(recorded.get("reason") or "")
+        self._failure_reported = self.state in (
+            ThinkingBackendState.FAILED,
+            ThinkingBackendState.FALLBACK,
+        )
+
+    def refresh(self) -> None:
+        """Refresh state written by the parent or another pipeline process."""
+        if not self.tracks_files():
+            return
+        recorded = read_thinking_status(self.url)
+        if recorded is not None:
+            self.adopt(recorded)
 
     def tracks_files(self) -> bool:
         return self.runtime_dir is not None and self.status_name is not None
@@ -177,13 +189,20 @@ class ThinkingBackendStatus:
         if not self.tracks_files():
             return
         target = contained_path(self.runtime_dir, self.status_name)
+        temporary = f"{target}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
             os.makedirs(self.runtime_dir, exist_ok=True)
-            with open(f"{target}.tmp", "w", encoding="utf-8") as handle:
+            with open(temporary, "w", encoding="utf-8") as handle:
                 json.dump(self.snapshot(), handle)
-            os.replace(f"{target}.tmp", target)
+            os.replace(temporary, target)
         except OSError as exc:
             logger.warning("Could not write the thinking backend status file: %s", exc)
+        finally:
+            try:
+                os.remove(temporary)
+            except OSError as exc:
+                if os.path.exists(temporary):
+                    logger.debug("Could not remove thinking status temp file: %s", exc)
 
     def mark_starting(self) -> None:
         self.state = ThinkingBackendState.STARTING
@@ -222,7 +241,7 @@ class ThinkingBackendStatus:
                 self.state.value,
                 reason,
                 (
-                    "strict mode requires SRT, so the server stops instead of falling back"
+                    "strict mode requires SRT, so the request fails instead of falling back"
                     if self.strict
                     else "thinking requests use the native decode from now on"
                 ),
@@ -279,6 +298,11 @@ class SRTThinkingClient:
         eos_token_id: int,
         think_end_token_id: int,
     ) -> list[int]:
+        # The managed server is started by the parent after pipeline workers are
+        # spawned. It can also fail there, so re-read that cross-process result
+        # before waiting on an address the parent already declared unavailable.
+        self.status.refresh()
+        self.available = self.status.state in _SRT_SERVING_STATES
         if not self.available:
             # The backend died earlier in this process; never wait on it again.
             raise RuntimeError("SenseNova thinking SRT backend is unavailable")
@@ -378,7 +402,21 @@ class ManagedSRTThinkingServer:
     def start(self) -> bool:
         """Spawn SRT and wait for it; raises in strict mode when it cannot serve."""
         self.status.mark_starting()
-        self.process.start()
+        try:
+            self.process.start()
+        except Exception as exc:
+            # No child owns the reserved port in this case. Publish the failure
+            # before pipeline workers can try that address themselves.
+            self._shutdown = True
+            reason = (
+                f"the internal SRT process could not start: {type(exc).__name__}: {exc}"
+            )
+            self.status.mark_unavailable(reason)
+            if self.status.strict:
+                raise RuntimeError(
+                    f"SenseNova thinking requires SRT: {reason}"
+                ) from exc
+            return False
         failure = self._wait_until_ready()
         if failure is None:
             _MANAGED_SERVERS.append(self)

@@ -32,6 +32,28 @@ VALIDATOR="${SCRIPT_DIR}/validate_sensenova_thinking_lifecycle.py"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+case "${SRT_FAILURE}" in
+  stop|kill) ;;
+  *)
+    echo "SRT_FAILURE must be stop or kill, got: ${SRT_FAILURE}" >&2
+    exit 2
+    ;;
+esac
+for mode in ${MODES}; do
+  case "${mode}" in
+    fallback|strict) ;;
+    *)
+      echo "MODES entries must be fallback or strict, got: ${mode}" >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ ! "${SRT_TIMEOUT_MS}" =~ ^[1-9][0-9]*000$ ]]; then
+  echo "SRT_TIMEOUT_MS must be a positive whole number of seconds, got: ${SRT_TIMEOUT_MS}" >&2
+  exit 2
+fi
+SRT_TIMEOUT_SECONDS=$((SRT_TIMEOUT_MS / 1000))
+
 SERVER_PID=""
 SRT_PID=""
 cleanup() {
@@ -119,6 +141,7 @@ run_mode() {
     echo "thinking_backend=srt"
     echo "srt_failure=${SRT_FAILURE}"
     echo "srt_timeout_ms=${SRT_TIMEOUT_MS}"
+    echo "thinking_runtime_dir=${dir}/thinking-runtime"
     echo "steps=${STEPS}"
     echo "max_think_tokens=${MAX_THINK_TOKENS}"
     echo "baseline_gpu_compute_pids=$(gpu_compute_pids)"
@@ -129,7 +152,9 @@ run_mode() {
   SGLANG_SENSENOVA_THINKING_BACKEND=srt \
   SGLANG_SENSENOVA_THINKING_STRICT="${strict}" \
   SGLANG_SENSENOVA_THINKING_MEM_FRACTION="${SGLANG_SENSENOVA_THINKING_MEM_FRACTION:-0.45}" \
+  SGLANG_SENSENOVA_THINKING_RUNTIME_DIR="${dir}/thinking-runtime" \
   sglang serve --model-path "${MODEL_PATH}" --host 127.0.0.1 --port "${SERVER_PORT}" \
+    --srt-encoder-timeout "${SRT_TIMEOUT_SECONDS}" \
     >"${dir}/server.log" 2>&1 &
   SERVER_PID=$!
   local deadline=$((SECONDS + STARTUP_TIMEOUT))
@@ -230,6 +255,12 @@ PY
 
   if [[ -n "${leftover_port}" ]]; then
     echo "${mode}: the SRT port is still listening after shutdown" >&2
+    verdict=1
+  fi
+  local baseline_gpu
+  baseline_gpu="$(sed -n 's/^baseline_gpu_compute_pids=//p' "${dir}/environment.txt")"
+  if [[ "${leftover_gpu}" != "${baseline_gpu}" ]]; then
+    echo "${mode}: GPU compute processes differ from the pre-run baseline" >&2
     verdict=1
   fi
   return "${verdict}"

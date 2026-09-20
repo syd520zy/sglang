@@ -15,7 +15,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 SCRIPTS="python/sglang/multimodal_gen/test/scripts"
 LIFECYCLE="${SCRIPTS}/validate_sensenova_thinking_lifecycle.sh"
-CONCURRENCY="${SCRIPTS}/compare_sensenova_thinking_concurrency.sh"
+CONCURRENCY_RUNNER="${SCRIPTS}/compare_sensenova_thinking_concurrency.sh"
 VIEWER="${SCRIPTS}/view_sensenova_thinking_results.py"
 
 # Old runs used the default output paths, which place results in the checkout.
@@ -31,10 +31,11 @@ OUT="${RESULT_ROOT}/${RUN_ID}"
 # The lifecycle covers both the fallback and the strict mode.
 MODES="${MODES:-fallback strict}"
 SRT_FAILURE="${SRT_FAILURE:-stop}"
+SRT_TIMEOUT_MS="${SRT_TIMEOUT_MS:-100000}"
 STEPS="${STEPS:-10}"
 MAX_THINK_TOKENS="${MAX_THINK_TOKENS:-64}"
 STEPS_LIST="${STEPS_LIST:-10}"
-CONCURRENCY="${CONCURRENCY:-1 2}"
+CONCURRENCY_LEVELS="${CONCURRENCY:-1 2}"
 BUDGETS="${BUDGETS:-64,128,256}"
 REPEATS="${REPEATS:-2}"
 
@@ -67,7 +68,8 @@ status=0
 if [[ -z "${SKIP_LIFECYCLE:-}" ]]; then
   echo "=== lifecycle acceptance (${MODES}) ==="
   mkdir -p "${OUT}/lifecycle"
-  MODES="${MODES}" SRT_FAILURE="${SRT_FAILURE}" STEPS="${STEPS}" \
+  MODES="${MODES}" SRT_FAILURE="${SRT_FAILURE}" SRT_TIMEOUT_MS="${SRT_TIMEOUT_MS}" \
+  STEPS="${STEPS}" \
   MAX_THINK_TOKENS="${MAX_THINK_TOKENS}" OUTPUT_DIR="${OUT}/lifecycle" \
     bash "${LIFECYCLE}" || status=1
 else
@@ -84,9 +86,9 @@ else
   echo
   echo "=== concurrency comparison (steps=${STEPS_LIST}) ==="
   mkdir -p "${OUT}/concurrency"
-  STEPS_LIST="${STEPS_LIST}" CONCURRENCY="${CONCURRENCY}" BUDGETS="${BUDGETS}" \
+  STEPS_LIST="${STEPS_LIST}" CONCURRENCY="${CONCURRENCY_LEVELS}" BUDGETS="${BUDGETS}" \
   REPEATS="${REPEATS}" OUTPUT_DIR="${OUT}/concurrency" \
-    bash "${CONCURRENCY}" || status=1
+    bash "${CONCURRENCY_RUNNER}" || status=1
 fi
 
 echo

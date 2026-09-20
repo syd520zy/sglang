@@ -48,6 +48,7 @@ wait_for_gpu_memory_release() {
 for steps in ${STEPS_LIST}; do
   echo "Round steps=${steps}: native..."
   SGLANG_SENSENOVA_THINKING_BACKEND=native \
+  SGLANG_SENSENOVA_THINKING_STRICT=0 \
   STEPS="${steps}" \
   OUTPUT_DIR="${RESULT_ROOT}/steps-${steps}/native" \
     bash "${RUNNER}" "$@"
@@ -56,6 +57,7 @@ for steps in ${STEPS_LIST}; do
 
   echo "Round steps=${steps}: SRT..."
   SGLANG_SENSENOVA_THINKING_BACKEND=srt \
+  SGLANG_SENSENOVA_THINKING_STRICT=1 \
   SGLANG_SENSENOVA_THINKING_MEM_FRACTION="${SGLANG_SENSENOVA_THINKING_MEM_FRACTION:-0.45}" \
   STEPS="${steps}" \
   OUTPUT_DIR="${RESULT_ROOT}/steps-${steps}/srt" \

@@ -68,13 +68,35 @@ def main():
 
     native_summary = load_summary(args.native_dir)
     srt_summary = load_summary(args.srt_dir)
-    if (
-        native_summary["settings"]["concurrency"]
-        != srt_summary["settings"]["concurrency"]
-    ):
-        raise RuntimeError("The two runs used different --concurrency values")
-    if native_summary["settings"]["budgets"] != srt_summary["settings"]["budgets"]:
-        raise RuntimeError("The two runs used different --budgets values")
+    comparable_settings = (
+        "model",
+        "prompt",
+        "resolution",
+        "steps",
+        "guidance_scale",
+        "budgets",
+        "concurrency",
+        "repeats",
+        "seed",
+    )
+    mismatches = {
+        key: {
+            "native": native_summary["settings"].get(key),
+            "srt": srt_summary["settings"].get(key),
+        }
+        for key in comparable_settings
+        if native_summary["settings"].get(key) != srt_summary["settings"].get(key)
+    }
+    if mismatches:
+        raise RuntimeError(f"The two runs used different settings: {mismatches}")
+    native_cases = set(native_summary["cases"])
+    srt_cases = set(srt_summary["cases"])
+    if native_cases != srt_cases:
+        raise RuntimeError(
+            "The two runs contain different cases: "
+            f"native_only={sorted(native_cases - srt_cases)}, "
+            f"srt_only={sorted(srt_cases - native_cases)}"
+        )
 
     native_backends = thinking_backends(native_summary)
     srt_backends = thinking_backends(srt_summary)
@@ -86,13 +108,13 @@ def main():
         )
 
     comparisons = {}
-    for case in sorted(set(native_summary["cases"]) & set(srt_summary["cases"])):
+    for case in sorted(native_cases):
         if case.endswith("_off"):
             continue
         comparisons[case] = compare_case(
             native_summary["cases"][case], srt_summary["cases"][case]
         )
-    for case in sorted(set(native_summary["cases"]) & set(srt_summary["cases"])):
+    for case in sorted(native_cases):
         if not case.endswith("_off"):
             continue
         comparisons[case] = compare_case(
