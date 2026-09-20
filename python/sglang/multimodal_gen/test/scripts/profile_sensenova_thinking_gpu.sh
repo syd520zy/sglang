@@ -24,9 +24,16 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 SERVER_PID=""
 cleanup() {
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    kill "${SERVER_PID}" 2>/dev/null || true
+    python - "${SERVER_PID}" <<'PY' || kill "${SERVER_PID}" 2>/dev/null || true
+import sys
+
+from sglang.srt.utils import kill_process_tree
+
+kill_process_tree(int(sys.argv[1]), wait_timeout=60)
+PY
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
+  SERVER_PID=""
 }
 trap cleanup EXIT INT TERM
 
