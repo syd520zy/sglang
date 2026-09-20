@@ -1575,6 +1575,7 @@ def test_sensenova_thinking_backend_info_reports_the_state(tmp_path, monkeypatch
         "strict": False,
         "reason": "SGLANG_SENSENOVA_THINKING_BACKEND=native",
         "log_file": None,
+        "pid": os.getpid(),
     }
     assert (
         thinking_backend_info(SimpleNamespace(pipeline_config=SimpleNamespace()))
@@ -1589,6 +1590,13 @@ def test_sensenova_thinking_backend_info_reports_the_state(tmp_path, monkeypatch
     assert info["state"] == "ready"
     assert info["backend"] == "srt"
     assert info["log_file"].startswith(str(tmp_path))
+
+    # The state is shared through the file, but strict is a live setting: a
+    # record written by a run with another setting must not report it.
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_STRICT", "1")
+    assert thinking_backend_info(server_args)["strict"] is True
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_STRICT", "0")
+    assert thinking_backend_info(server_args)["strict"] is False
 
 
 def test_sensenova_thinking_runtime_files_never_escape_the_directory(tmp_path):

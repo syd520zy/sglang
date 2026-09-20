@@ -13,6 +13,9 @@ import json
 from pathlib import Path
 
 MAX_LISTED = 8
+MAX_DEPTH = 3
+
+REPORT_NAMES = ("summary.json", "comparison.json", "environment.txt")
 
 
 def load_json(path):
@@ -150,8 +153,7 @@ def is_concurrency_summary(summary):
     )
 
 
-def describe(directory):
-    print(f"--- {directory}")
+def emit_directory(directory):
     emit_environment(directory)
     summary = load_json(directory / "summary.json")
     if summary is not None:
@@ -164,9 +166,41 @@ def describe(directory):
         emit_comparison(comparison)
     if any(directory.glob("lifecycle-*.json")) or (directory / "residue.txt").exists():
         emit_lifecycle(directory)
-    for child in sorted(p for p in directory.iterdir() if p.is_dir()):
-        if (child / "summary.json").exists() or any(child.glob("lifecycle-*.json")):
-            describe(child)
+
+
+def has_report(directory):
+    """True when a directory holds files this viewer knows how to print."""
+    if any((directory / name).exists() for name in REPORT_NAMES):
+        return True
+    return (
+        any(directory.glob("lifecycle-*.json")) or (directory / "residue.txt").exists()
+    )
+
+
+def describe(directory, depth=0):
+    print(f"--- {directory}")
+    content = io.StringIO()
+    with contextlib.redirect_stdout(content):
+        emit_directory(directory)
+        # A run nests its results under the round and the mode, so descend while
+        # a directory still has something to show.
+        if depth < MAX_DEPTH:
+            for child in sorted(p for p in directory.iterdir() if p.is_dir()):
+                if has_report(child):
+                    describe(child, depth + 1)
+    text = content.getvalue().rstrip()
+    print(text if text else unexpected(directory))
+
+
+def unexpected(directory):
+    """Report a directory that printed nothing, so a result is never silent."""
+    entries = sorted(path.name for path in directory.iterdir())
+    if not entries:
+        return "  (the directory is empty)"
+    listed = ", ".join(entries[:MAX_LISTED])
+    if len(entries) > MAX_LISTED:
+        listed += f", ... ({len(entries)} entries)"
+    return f"  (no result files this viewer recognizes; contains: {listed})"
 
 
 def main():

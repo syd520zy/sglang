@@ -169,6 +169,8 @@ class ThinkingBackendStatus:
             "strict": self.strict,
             "reason": self.reason,
             "log_file": self.log_path(),
+            # Which process wrote this record, so a stale one is identifiable.
+            "pid": os.getpid(),
         }
 
     def write(self) -> None:
@@ -446,11 +448,14 @@ def thinking_backend_info(server_args) -> dict | None:
             "strict": strict,
             "reason": f"{_ENV_BACKEND}=native",
             "log_file": None,
+            "pid": os.getpid(),
         }
 
     recorded = read_thinking_status(url)
     if recorded is not None:
-        return recorded
+        # The record carries the state the workers share; the configuration is
+        # read live, so a file left by an earlier run cannot misreport it.
+        return dict(recorded, url=url, strict=strict)
     runtime_dir, _, log_name = runtime_files(url)
     return {
         "state": ThinkingBackendState.STARTING.value,
@@ -459,6 +464,7 @@ def thinking_backend_info(server_args) -> dict | None:
         "strict": strict,
         "reason": "no state recorded yet",
         "log_file": contained_path(runtime_dir, log_name),
+        "pid": os.getpid(),
     }
 
 

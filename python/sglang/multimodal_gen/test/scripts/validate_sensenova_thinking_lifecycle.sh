@@ -96,7 +96,21 @@ run_mode() {
   if [[ "${mode}" == "strict" ]]; then strict=1; else strict=0; fi
   mkdir -p "${dir}"
 
-  wait_for_gpu_memory_release
+  if ! wait_for_gpu_memory_release; then
+    echo "GPU ${GPU_ID} was not released before ${mode}; refusing to measure it" >&2
+    return 1
+  fi
+
+  # A server left behind by an earlier mode would answer /health for us and
+  # then be the one under test, so the port has to be free before we start.
+  local port_owner
+  port_owner="$(listening_pid_on_port "${SERVER_PORT}")"
+  if [[ -n "${port_owner}" ]]; then
+    echo "port ${SERVER_PORT} is still held by pid ${port_owner}; " \
+      "refusing to start ${mode}" >&2
+    return 1
+  fi
+
   {
     echo "sglang_commit=$(git rev-parse HEAD)"
     echo "mode=${mode}"

@@ -277,6 +277,12 @@ def phase_after_kill(args, output_dir):
     check(checks, "second_request_never_reaches_srt", second_is_correct, second)
     check(
         checks,
+        "server_info_reports_the_strict_flag",
+        before_backend.get("strict") is strict,
+        {"reported": before_backend.get("strict"), "started_with": strict},
+    )
+    check(
+        checks,
         "state_reports_native_after_the_failure",
         end_backend["backend"] == "native",
         end_backend,
