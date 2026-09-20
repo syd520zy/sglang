@@ -130,9 +130,13 @@ P1-3（`validate_sensenova_thinking_lifecycle.sh`）：
 | `state` | `disabled` / `starting` / `ready` / `failed` / `fallback` / `stopped` |
 | `backend` | 当前实际服务思考请求的后端：`srt` 或 `native` |
 | `url` | 内部 SRT 地址；未启用时为 `null` |
-| `strict` | 是否启用了 strict 模式 |
+| `strict` | 是否启用 strict 模式，按当前进程的环境变量实时读取 |
 | `reason` | 最近一次失败原因 |
 | `log_file` | 内部 SRT 的子服务日志路径 |
+| `pid` | 最后一次写入状态文件的进程 pid，用于判断这条记录是否已过期 |
+
+`state`、`reason` 和 `pid` 来自跨进程共享的状态文件，`strict` 和 `url` 始终取当前进程的配置：
+同一个 SRT 端口被不同运行复用时，旧文件不会让新服务报告错误的 strict 或地址。
 
 相关环境变量：
 
