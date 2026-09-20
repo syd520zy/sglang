@@ -1553,8 +1553,13 @@ def test_sensenova_thinking_status_records_failure_once(tmp_path, monkeypatch):
     assert state["state"] == "fallback"
     assert state["backend"] == "native"
     assert "exited with code 1" in state["reason"]
-    assert len(handler.messages) == 1
-    assert "exited with code 1" in handler.messages[0]
+    failure_messages = [
+        message
+        for message in handler.messages
+        if "thinking backend unavailable" in message
+    ]
+    assert len(failure_messages) == 1
+    assert "exited with code 1" in failure_messages[0]
 
 
 def test_sensenova_thinking_strict_mode_stops_instead_of_falling_back(
