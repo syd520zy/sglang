@@ -83,13 +83,16 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     model_precision: str = "bf16"
     should_use_guidance: bool = True
     supports_cfg_parallel: bool = False
+    srt_thinking_dynamic_batching: bool = False
 
     def supports_dynamic_batching(self):
         return True
 
     def supports_dynamic_batching_for_request(self, batch) -> bool:
         sampling_params = getattr(batch, "sampling_params", None)
-        return not bool(getattr(sampling_params, "think_mode", DEFAULT_THINK_MODE))
+        return self.srt_thinking_dynamic_batching or not bool(
+            getattr(sampling_params, "think_mode", DEFAULT_THINK_MODE)
+        )
 
     def estimate_request_cost(self, batch) -> float:
         image_tokens = (int(batch.width) // RESOLUTION_ALIGNMENT) * (

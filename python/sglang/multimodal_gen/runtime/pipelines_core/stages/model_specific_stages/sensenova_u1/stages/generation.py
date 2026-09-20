@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
+    BatchedSRTThinkingFallbackRequired,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -85,11 +88,6 @@ class SenseNovaU1GenerationStage(PipelineStage):
             raise ValueError(
                 "SenseNova-U1 dynamic batch must contain at least one prompt"
             )
-        if batch_size > 1 and options.think_mode:
-            raise ValueError(
-                "SenseNova-U1 dynamic batching does not support think_mode"
-            )
-
         dynamic_seeds = batch.extra.get("dynamic_batch_seeds")
         if dynamic_seeds is None:
             dynamic_seeds = batch.seed if isinstance(batch.seed, list) else [batch.seed]
@@ -111,45 +109,103 @@ class SenseNovaU1GenerationStage(PipelineStage):
             )
         seed = seeds[0] if batch_size == 1 else seeds
 
-        out = self.model.t2i_generate(
-            self.tokenizer,
-            batch.prompt,
-            image_size=(int(batch.width), int(batch.height)),
-            cfg_scale=float(batch.guidance_scale),
-            cfg_norm=options.cfg_norm,
-            timestep_shift=options.timestep_shift,
-            enable_timestep_shift=options.enable_timestep_shift,
-            cfg_interval=options.cfg_interval,
-            num_steps=int(batch.num_inference_steps),
-            batch_size=batch_size,
-            t_eps=options.t_eps,
-            think_mode=options.think_mode,
-            max_think_tokens=options.max_think_tokens,
-            profile_stages=options.profile_stages,
-            thinking_backend=self.thinking_backend,
-            seed=seed,
+        generation_kwargs = {
+            "image_size": (int(batch.width), int(batch.height)),
+            "cfg_scale": float(batch.guidance_scale),
+            "cfg_norm": options.cfg_norm,
+            "timestep_shift": options.timestep_shift,
+            "enable_timestep_shift": options.enable_timestep_shift,
+            "cfg_interval": options.cfg_interval,
+            "num_steps": int(batch.num_inference_steps),
+            "t_eps": options.t_eps,
+            "think_mode": options.think_mode,
+            "max_think_tokens": options.max_think_tokens,
+            "profile_stages": options.profile_stages,
+        }
+
+        def generate(prompt, item_batch_size, item_seed, thinking_backend):
+            return self.model.t2i_generate(
+                self.tokenizer,
+                prompt,
+                batch_size=item_batch_size,
+                thinking_backend=thinking_backend,
+                seed=item_seed,
+                **generation_kwargs,
+            )
+
+        use_native_fallback = (
+            batch_size > 1 and options.think_mode and self.thinking_backend is None
         )
-        think_text = None
-        if options.think_mode:
+        if not use_native_fallback:
+            try:
+                out = generate(batch.prompt, batch_size, seed, self.thinking_backend)
+            except BatchedSRTThinkingFallbackRequired:
+                use_native_fallback = True
+
+        per_request_timings = None
+        if use_native_fallback:
+            image_batches = []
+            think_text = []
+            think_token_counts = []
+            thinking_backends = []
+            per_request_timings = []
+            for prompt, item_seed in zip(prompts, seeds):
+                item_images, item_think_text = generate(prompt, 1, item_seed, None)
+                image_batches.append(item_images)
+                think_text.append(item_think_text)
+                think_token_counts.append(
+                    int(getattr(self.model, "last_think_token_count", 0))
+                )
+                thinking_backends.append(
+                    getattr(self.model, "last_thinking_backend", "native")
+                )
+                per_request_timings.append(
+                    dict(getattr(self.model, "last_profile_timings_ms", {}))
+                )
+            images = torch.cat(image_batches, dim=0)
+        elif options.think_mode:
             images, think_text = out
+            think_text = think_text if isinstance(think_text, list) else [think_text]
+            think_token_counts = list(
+                getattr(
+                    self.model,
+                    "last_think_token_counts",
+                    [getattr(self.model, "last_think_token_count", 0)] * batch_size,
+                )
+            )
+            thinking_backends = list(
+                getattr(
+                    self.model,
+                    "last_thinking_backends",
+                    [getattr(self.model, "last_thinking_backend", "native")]
+                    * batch_size,
+                )
+            )
         else:
             images = out
+            think_text = None
 
         images = _denorm_sensenova_output(images)
         samples = [sample.contiguous() for sample in images]
-        usage = {}
-        if think_text is not None:
-            usage.update(
-                think_text=think_text,
-                reasoning_tokens=int(getattr(self.model, "last_think_token_count", 0)),
-                thinking_backend=getattr(self.model, "last_thinking_backend", "native"),
-            )
-        if options.profile_stages:
-            usage["stage_timings_ms"] = dict(
-                getattr(self.model, "last_profile_timings_ms", {})
-            )
+        usage_list = []
+        for index in range(batch_size):
+            usage = {}
+            if think_text is not None:
+                usage.update(
+                    think_text=think_text[index],
+                    reasoning_tokens=int(think_token_counts[index]),
+                    thinking_backend=thinking_backends[index],
+                )
+            if options.profile_stages:
+                usage["stage_timings_ms"] = (
+                    per_request_timings[index]
+                    if per_request_timings is not None
+                    else dict(getattr(self.model, "last_profile_timings_ms", {}))
+                )
+            usage_list.append(usage or None)
         return OutputBatch(
             output=samples,
             metrics=batch.metrics,
-            usage=usage or None,
+            usage=usage_list[0] if batch_size == 1 else None,
+            usage_list=usage_list if batch_size > 1 else None,
         )

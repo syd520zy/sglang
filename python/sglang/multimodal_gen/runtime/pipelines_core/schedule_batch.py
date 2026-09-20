@@ -505,6 +505,7 @@ class OutputBatch:
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
     usage: dict[str, Any] | None = None
+    usage_list: list[dict[str, Any] | None] | None = None
 
     def drop_payload_for_warmup(self) -> None:
         self.output = None

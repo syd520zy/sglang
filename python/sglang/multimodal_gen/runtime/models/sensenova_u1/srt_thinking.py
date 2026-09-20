@@ -16,6 +16,11 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+
+class BatchedSRTThinkingFallbackRequired(RuntimeError):
+    """Ask the generation stage to preserve native fallback per request."""
+
+
 _ENV_BACKEND = "SGLANG_SENSENOVA_THINKING_BACKEND"
 _ENV_STRICT = "SGLANG_SENSENOVA_THINKING_STRICT"
 _ENV_RUNTIME_DIR = "SGLANG_SENSENOVA_THINKING_RUNTIME_DIR"
@@ -298,6 +303,21 @@ class SRTThinkingClient:
         eos_token_id: int,
         think_end_token_id: int,
     ) -> list[int]:
+        return self.generate_batch(
+            [input_ids],
+            max_think_tokens=max_think_tokens,
+            eos_token_id=eos_token_id,
+            think_end_token_id=think_end_token_id,
+        )[0]
+
+    def generate_batch(
+        self,
+        input_ids: list[list[int]],
+        *,
+        max_think_tokens: int,
+        eos_token_id: int,
+        think_end_token_id: int,
+    ) -> list[list[int]]:
         # The managed server is started by the parent after pipeline workers are
         # spawned. It can also fail there, so re-read that cross-process result
         # before waiting on an address the parent already declared unavailable.
@@ -310,7 +330,7 @@ class SRTThinkingClient:
             response = requests.post(
                 f"{self.url}/generate",
                 json={
-                    "input_ids": input_ids,
+                    "input_ids": input_ids[0] if len(input_ids) == 1 else input_ids,
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": max(1, max_think_tokens - 1),
@@ -323,23 +343,34 @@ class SRTThinkingClient:
             )
             response.raise_for_status()
             payload = response.json()
-            output_ids = (
-                payload.get("output_ids") if isinstance(payload, dict) else None
-            )
         except (requests.RequestException, ValueError) as exc:
             self.fail(exc)
             raise
-        if not isinstance(output_ids, list):
+        responses = [payload] if isinstance(payload, dict) else payload
+        if not isinstance(responses, list) or len(responses) != len(input_ids):
+            exc = TypeError(
+                "SenseNova thinking SRT response does not match the request batch"
+            )
+            self.fail(exc)
+            raise exc
+        output_ids = [
+            item.get("output_ids") if isinstance(item, dict) else None
+            for item in responses
+        ]
+        if not all(isinstance(item, list) for item in output_ids):
             exc = TypeError("SenseNova thinking SRT response has no output_ids")
             self.fail(exc)
             raise exc
         self.status.mark_ready()
-        return normalize_thinking_output_ids(
-            output_ids,
-            max_think_tokens=max_think_tokens,
-            eos_token_id=eos_token_id,
-            think_end_token_id=think_end_token_id,
-        )
+        return [
+            normalize_thinking_output_ids(
+                item,
+                max_think_tokens=max_think_tokens,
+                eos_token_id=eos_token_id,
+                think_end_token_id=think_end_token_id,
+            )
+            for item in output_ids
+        ]
 
     def fail(self, exc: BaseException) -> bool:
         """Mark SRT unusable; True when this was its first failure on this client."""
@@ -508,7 +539,11 @@ def thinking_backend_info(server_args) -> dict | None:
 
 def prepare_managed_srt_thinking(server_args):
     """Reserve the internal text runtime before diffusion workers are spawned."""
-    if not _is_sensenova_pipeline(server_args) or server_args.srt_encoder_url:
+    if not _is_sensenova_pipeline(server_args):
+        return None
+    pipeline_config = server_args.pipeline_config
+    pipeline_config.srt_thinking_dynamic_batching = bool(server_args.srt_encoder_url)
+    if server_args.srt_encoder_url:
         return None
     backend = os.environ.get(_ENV_BACKEND, "srt").lower()
     if backend == "native":
@@ -520,6 +555,17 @@ def prepare_managed_srt_thinking(server_args):
     from sglang.srt.server_args import ServerArgs as SRTServerArgs
     from sglang.srt.utils.network import get_free_port
 
+    max_running_requests = int(
+        os.environ.get("SGLANG_SENSENOVA_THINKING_MAX_RUNNING_REQUESTS", "8")
+    )
+    cuda_graph_max_bs = int(
+        os.environ.get("SGLANG_SENSENOVA_THINKING_CUDA_GRAPH_MAX_BS", "2")
+    )
+    if max_running_requests < 1 or cuda_graph_max_bs < 1:
+        raise ValueError(
+            "SenseNova thinking max running requests and CUDA graph max batch "
+            "size must both be positive"
+        )
     host = "127.0.0.1"
     port = get_free_port()
     srt_args = SRTServerArgs(
@@ -536,8 +582,8 @@ def prepare_managed_srt_thinking(server_args):
         mem_fraction_static=float(
             os.environ.get("SGLANG_SENSENOVA_THINKING_MEM_FRACTION", "0.45")
         ),
-        max_running_requests=8,
-        cuda_graph_max_bs_decode=2,
+        max_running_requests=max_running_requests,
+        cuda_graph_max_bs_decode=cuda_graph_max_bs,
     )
     url = f"http://{host}:{port}"
     status = ThinkingBackendStatus.for_url(url)
@@ -547,4 +593,5 @@ def prepare_managed_srt_thinking(server_args):
         name="sensenova-srt-thinking",
     )
     server_args.srt_encoder_url = url
+    pipeline_config.srt_thinking_dynamic_batching = True
     return ManagedSRTThinkingServer(process=process, url=url, status=status)

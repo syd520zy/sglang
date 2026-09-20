@@ -994,6 +994,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 and req_index < len(output_batch.metrics_list)
                 else deepcopy(output_batch.metrics)
             )
+            usage = (
+                deepcopy(output_batch.usage_list[req_index])
+                if output_batch.usage_list is not None
+                and req_index < len(output_batch.usage_list)
+                else deepcopy(output_batch.usage)
+            )
             split = OutputBatch(
                 output=self._slice_batched_value(
                     output_batch.output, start, end, total_items
@@ -1023,9 +1029,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.noise_pred, start, end, total_items
                 ),
                 peak_memory_mb=output_batch.peak_memory_mb,
-                # Stage profiling and model-specific response metadata belong
-                # on every response produced from the merged execution.
-                usage=deepcopy(output_batch.usage),
+                usage=usage,
             )
             if split.metrics is not None:
                 split.metrics.request_id = req.request_id

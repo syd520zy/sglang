@@ -62,6 +62,9 @@ trap cleanup EXIT INT TERM
   echo "batching_delay_ms=${BATCHING_DELAY_MS}"
   echo "batching_metrics=${BATCHING_METRICS}"
   echo "thinking_mem_fraction=${SGLANG_SENSENOVA_THINKING_MEM_FRACTION:-0.45}"
+  echo "thinking_max_running_requests=${SGLANG_SENSENOVA_THINKING_MAX_RUNNING_REQUESTS:-8}"
+  echo "thinking_cuda_graph_max_bs=${SGLANG_SENSENOVA_THINKING_CUDA_GRAPH_MAX_BS:-2}"
+  echo "thinking_context_length=4096"
   echo "thinking_runtime_dir=${SGLANG_SENSENOVA_THINKING_RUNTIME_DIR}"
   python -c 'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")'
   nvidia-smi
@@ -112,5 +115,16 @@ python "${PROFILER}" \
 # Dispatch-level evidence for whether the diffusion pipeline merged a wave.
 grep -nE "Dynamic batch stats|Batch admission enabled" "${OUTPUT_DIR}/server.log" \
   >"${OUTPUT_DIR}/batch-metrics.log" || true
+
+if [[ "${THINKING_BACKEND}" == "srt" ]]; then
+  MAX_CONCURRENCY="$(printf '%s\n' ${CONCURRENCY} | sort -n | tail -n 1)"
+  python "${SCRIPT_DIR}/inspect_sensenova_srt_runtime.py" \
+    --runtime-dir "${SGLANG_SENSENOVA_THINKING_RUNTIME_DIR}" \
+    --context-length 4096 \
+    --max-concurrency "${MAX_CONCURRENCY}" \
+    --cuda-graph-max-bs "${SGLANG_SENSENOVA_THINKING_CUDA_GRAPH_MAX_BS:-2}" \
+    --output "${OUTPUT_DIR}/srt-runtime-summary.json" \
+    | tee "${OUTPUT_DIR}/srt-runtime-summary.log"
+fi
 
 echo "Results: ${OUTPUT_DIR}"

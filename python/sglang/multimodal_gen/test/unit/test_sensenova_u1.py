@@ -78,6 +78,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
     checked_name,
     contained_path,
     normalize_thinking_output_ids,
+    prepare_managed_srt_thinking,
     runtime_files,
     thinking_backend_info,
     thinking_strict_enabled,
@@ -95,6 +96,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+from sglang.multimodal_gen.test.scripts.inspect_sensenova_srt_runtime import (
+    inspect_runtime_log,
+)
 from sglang.multimodal_gen.test.scripts.profile_sensenova_thinking_concurrency import (
     summarize_wave,
 )
@@ -105,9 +109,11 @@ from sglang.srt.models.sensenova_u1 import _understanding_weights
 class _FakeSenseNovaModel:
     def __init__(self):
         self.call_kwargs = None
+        self.call_kwargs_list = []
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
+        self.call_kwargs_list.append(self.call_kwargs)
         if kwargs["profile_stages"]:
             self.last_profile_timings_ms = {
                 "input_prepare": 1.0,
@@ -130,11 +136,13 @@ class _FakeSenseNovaModel:
         )
         image = sample.repeat(kwargs["batch_size"], 1, 1, 1)
         if kwargs["think_mode"]:
+            backend = "srt" if kwargs.get("thinking_backend") is not None else "native"
             self.last_think_token_count = 3
-            self.last_thinking_backend = (
-                "srt" if kwargs.get("thinking_backend") is not None else "native"
-            )
-            return image, "draft</think>"
+            self.last_think_token_counts = [3] * kwargs["batch_size"]
+            self.last_thinking_backend = backend
+            self.last_thinking_backends = [backend] * kwargs["batch_size"]
+            think_text = ["draft</think>"] * kwargs["batch_size"]
+            return image, think_text[0] if kwargs["batch_size"] == 1 else think_text
         return image
 
 
@@ -811,7 +819,7 @@ def test_sensenova_u1_multi_output_request_is_not_dynamically_batched():
     )
 
 
-def test_sensenova_u1_think_mode_request_is_dispatched_without_batching():
+def test_sensenova_u1_think_mode_batching_requires_srt():
     scheduler = object.__new__(Scheduler)
     scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
     scheduler._batch_admission = SimpleNamespace(enabled=True)
@@ -831,6 +839,20 @@ def test_sensenova_u1_think_mode_request_is_dispatched_without_batching():
     assert items[0][0] == b"identity"
     assert items[0][1] is request
     assert not scheduler.waiting_queue
+
+    scheduler.server_args.pipeline_config.srt_thinking_dynamic_batching = True
+    assert scheduler._can_dynamic_batch(request, request)
+
+
+def test_sensenova_u1_external_srt_enables_thinking_batching():
+    config = SenseNovaU1PipelineConfig()
+    server_args = SimpleNamespace(
+        pipeline_config=config,
+        srt_encoder_url="http://127.0.0.1:31000",
+    )
+
+    assert prepare_managed_srt_thinking(server_args) is None
+    assert config.srt_thinking_dynamic_batching
 
 
 @pytest.mark.parametrize(
@@ -898,7 +920,10 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
         OutputBatch(
             output=[torch.tensor([7]), torch.tensor([19])],
             output_file_paths=expected_paths,
-            usage={"stage_timings_ms": {"total": 12.5}},
+            usage_list=[
+                {"think_text": "first", "reasoning_tokens": 7},
+                {"think_text": "second", "reasoning_tokens": 19},
+            ],
         ),
         requests,
     )
@@ -907,8 +932,8 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
         [path] for path in expected_paths
     ]
     assert [output.usage for output in outputs] == [
-        {"stage_timings_ms": {"total": 12.5}},
-        {"stage_timings_ms": {"total": 12.5}},
+        {"think_text": "first", "reasoning_tokens": 7},
+        {"think_text": "second", "reasoning_tokens": 19},
     ]
     assert outputs[0].usage is not outputs[1].usage
     assert (
@@ -952,6 +977,23 @@ def test_sensenova_thinking_concurrency_summary_does_not_count_queueing_as_overl
     assert serial["parallelism_ratio"] == 1.0
     assert not serial.get("think_window_overlap_pairs")
     assert parallel["parallelism_ratio"] == 2.0
+
+
+def test_sensenova_srt_runtime_inspection_checks_graph_and_kv_capacity():
+    report = inspect_runtime_log(
+        """
+Capture target decode CUDA graph begin. backend=piecewise, num_tokens_per_req=1, bs=[1, 2], avail mem=10.00 GB
+Capture target decode CUDA graph end. elapsed=1.00 s, mem usage=1.00 GB, avail mem=9.00 GB.
+Post-capture KV sizing: KV cache allocated. dtype: torch.bfloat16, #tokens: 12288, KV size: 1.00 GB, avail mem=8.00 GB
+""",
+        context_length=4096,
+        max_concurrency=2,
+        cuda_graph_max_bs=2,
+    )
+
+    assert report["passed"]
+    assert report["cuda_graph"]["captured_batch_sizes"] == [1, 2]
+    assert report["kv_pool"]["required_tokens"] == 8192
 
 
 def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
@@ -1482,6 +1524,78 @@ def test_sensenova_srt_thinking_client_uses_token_api(monkeypatch):
     }
 
 
+def test_sensenova_srt_thinking_client_batches_token_requests(monkeypatch):
+    request = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{"output_ids": [7, 9]}, {"output_ids": [6, 5]}]
+
+    def post(url, **kwargs):
+        request.update(url=url, **kwargs)
+        return Response()
+
+    monkeypatch.setattr("requests.post", post)
+    output_ids = SRTThinkingClient("http://127.0.0.1:1234", 3, 90).generate_batch(
+        [[1, 2], [3]],
+        max_think_tokens=3,
+        eos_token_id=8,
+        think_end_token_id=9,
+    )
+
+    assert output_ids == [[7, 9], [6, 5, 9]]
+    assert request["json"]["input_ids"] == [[1, 2], [3]]
+
+
+def test_sensenova_srt_replay_pads_after_each_complete_prefix():
+    captured = {}
+
+    def prefix_forward(input_ids, indexes, attention_mask):
+        captured.update(
+            input_ids=input_ids,
+            indexes=indexes,
+            attention_mask=attention_mask,
+        )
+        return object(), torch.zeros((*input_ids.shape, 4))
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        _t2i_prefix_forward=prefix_forward,
+    )
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.tensor([[20, 21]])}
+
+    tokenizer = Tokenizer()
+
+    _, _, indexes, key_valid_mask, lengths = NEOChatModel._replay_srt_think_prefix(
+        model,
+        tokenizer,
+        torch.tensor([[1, 2, 3], [4, 5, 0]]),
+        torch.tensor([3, 2]),
+        [[7, 9], [6, 9]],
+        "<img>",
+    )
+
+    assert captured["input_ids"].tolist() == [
+        [1, 2, 3, 7, 9, 20, 21],
+        [4, 5, 6, 9, 20, 21, 0],
+    ]
+    assert indexes.shape == (2, 3, 7)
+    assert key_valid_mask.tolist() == [
+        [True, True, True, True, True, True, True],
+        [True, True, True, True, True, True, False],
+    ]
+    assert lengths.tolist() == [7, 6]
+
+
 class _DeadSRTProcess:
     """Stands in for an SRT subprocess that exited before it served."""
 
@@ -1765,7 +1879,7 @@ def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
     assert model.call_kwargs["seed"] == [7, 19]
 
 
-def test_sensenova_u1_generation_stage_rejects_batched_think_mode():
+def test_sensenova_u1_generation_stage_batches_srt_thinking_usage():
     sampling = SenseNovaU1SamplingParams(
         prompt="first prompt",
         width=1024,
@@ -1787,10 +1901,62 @@ def test_sensenova_u1_generation_stage_rejects_batched_think_mode():
         metrics=None,
     )
 
-    with pytest.raises(ValueError, match="think_mode"):
-        SenseNovaU1GenerationStage(
-            model=_FakeSenseNovaModel(), tokenizer="tok"
-        ).forward(batch, server_args=SimpleNamespace())
+    model = _FakeSenseNovaModel()
+    output = SenseNovaU1GenerationStage(
+        model=model, tokenizer="tok", thinking_backend=object()
+    ).forward(batch, server_args=SimpleNamespace())
+
+    assert len(output.output) == 2
+    assert model.call_kwargs["batch_size"] == 2
+    assert output.usage is None
+    assert output.usage_list == [
+        {
+            "think_text": "draft</think>",
+            "reasoning_tokens": 3,
+            "thinking_backend": "srt",
+        },
+        {
+            "think_text": "draft</think>",
+            "reasoning_tokens": 3,
+            "thinking_backend": "srt",
+        },
+    ]
+
+
+def test_sensenova_u1_generation_stage_runs_native_fallback_sequentially():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="first prompt", width=1024, height=1024, think_mode=True
+    )
+    batch = SimpleNamespace(
+        prompt=["first prompt", "second prompt"],
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=1,
+        extra={
+            **sampling.build_request_extra(),
+            "dynamic_batch_seeds": [7, 19],
+        },
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+
+    output = SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    assert [call["prompt"] for call in model.call_kwargs_list] == [
+        "first prompt",
+        "second prompt",
+    ]
+    assert [call["seed"] for call in model.call_kwargs_list] == [7, 19]
+    assert all(call["batch_size"] == 1 for call in model.call_kwargs_list)
+    assert [usage["thinking_backend"] for usage in output.usage_list] == [
+        "native",
+        "native",
+    ]
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():

@@ -16,6 +16,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
+    BatchedSRTThinkingFallbackRequired,
+)
+
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_fm_modules import (
@@ -833,41 +837,92 @@ class NEOChatModel(PreTrainedModel):
         tokenizer,
         thinking_backend,
         input_ids,
+        prefix_lengths,
         max_think_tokens,
     ):
         template = get_conv_template(self.template)
         eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
         think_end_token_id = tokenizer.convert_tokens_to_ids("</think>")
-        output_ids = thinking_backend.generate(
-            input_ids[0].tolist(),
+        request_ids = [
+            input_ids[index, : int(length)].tolist()
+            for index, length in enumerate(prefix_lengths.tolist())
+        ]
+        output_ids = thinking_backend.generate_batch(
+            request_ids,
             max_think_tokens=max_think_tokens,
             eos_token_id=eos_token_id,
             think_end_token_id=think_end_token_id,
         )
-        token_ids = torch.tensor(
-            [output_ids], dtype=input_ids.dtype, device=input_ids.device
-        )
-        self.last_think_token_count = len(output_ids)
-        return token_ids, tokenizer.decode(output_ids, skip_special_tokens=False)
+        self.last_think_token_counts = [len(item) for item in output_ids]
+        self.last_think_token_count = self.last_think_token_counts[0]
+        return output_ids, [
+            tokenizer.decode(item, skip_special_tokens=False) for item in output_ids
+        ]
 
     def _replay_srt_think_prefix(
-        self, tokenizer, input_ids, think_token_ids, IMG_START_TOKEN
+        self,
+        tokenizer,
+        input_ids,
+        prefix_lengths,
+        think_token_ids,
+        IMG_START_TOKEN,
     ):
         append_ids = tokenizer(
             "\n\n" + IMG_START_TOKEN,
             return_tensors="pt",
             add_special_tokens=False,
         )["input_ids"].to(self.device)
-        replay_ids = torch.cat((input_ids, think_token_ids, append_ids), dim=1)
-        t_idx = torch.arange(
-            replay_ids.shape[1], dtype=torch.long, device=replay_ids.device
+        replay_rows = [
+            torch.cat(
+                (
+                    input_ids[index, : int(prefix_length)],
+                    torch.tensor(
+                        think_token_ids[index],
+                        dtype=input_ids.dtype,
+                        device=input_ids.device,
+                    ),
+                    append_ids[0],
+                )
+            )
+            for index, prefix_length in enumerate(prefix_lengths.tolist())
+        ]
+        replay_lengths = torch.tensor(
+            [row.shape[0] for row in replay_rows],
+            dtype=torch.long,
+            device=input_ids.device,
         )
-        indexes = torch.stack((t_idx, torch.zeros_like(t_idx), torch.zeros_like(t_idx)))
-        attention_mask = {"full_attention": create_block_causal_mask(t_idx)}
+        max_length = int(replay_lengths.max().item())
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(tokenizer, "eos_token_id", 0)
+        replay_ids = torch.full(
+            (len(replay_rows), max_length),
+            int(pad_token_id or 0),
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        key_valid_mask = torch.zeros(
+            (len(replay_rows), max_length),
+            dtype=torch.bool,
+            device=input_ids.device,
+        )
+        for index, row in enumerate(replay_rows):
+            replay_ids[index, : row.shape[0]] = row
+            key_valid_mask[index, : row.shape[0]] = True
+        t_idx = torch.arange(
+            max_length, dtype=torch.long, device=replay_ids.device
+        ).expand(len(replay_rows), -1)
+        batched_indexes = torch.stack(
+            (t_idx, torch.zeros_like(t_idx), torch.zeros_like(t_idx)), dim=1
+        )
+        indexes = batched_indexes[0] if len(replay_rows) == 1 else batched_indexes
+        attention_mask = {
+            "full_attention": create_block_causal_mask(t_idx, key_valid_mask)
+        }
         cache, hidden_states = self._t2i_prefix_forward(
             replay_ids, indexes, attention_mask
         )
-        return cache, hidden_states, indexes
+        return cache, hidden_states, indexes, key_valid_mask, replay_lengths
 
     def _generate_think(
         self,
@@ -2583,16 +2638,14 @@ class NEOChatModel(PreTrainedModel):
             raise ValueError(
                 f"batch_size={batch_size} does not match {len(prompts)} prompts"
             )
-        if len(prompts) > 1 and think_mode:
-            raise ValueError(
-                "batched SenseNova-U1 generation does not support think_mode"
-            )
         self._notify_layer_offload_phase("prefix")
         merge_size = int(1 / self.downsample_ratio)
 
         self.config.t_eps = t_eps
         think_text = ""
         self.last_think_token_count = 0
+        self.last_think_token_counts = [0] * len(prompts)
+        self.last_thinking_backends = [None] * len(prompts)
         needs_cfg = cfg_scale > 1
 
         think_content = (
@@ -2666,10 +2719,11 @@ class NEOChatModel(PreTrainedModel):
             if thinking_backend is not None:
                 profiler.mark("condition_prefill")
                 try:
-                    think_token_ids, think_text = self._request_srt_think_tokens(
+                    think_token_ids, think_texts = self._request_srt_think_tokens(
                         tokenizer,
                         thinking_backend,
                         input_ids_condition,
+                        condition_prefix_lengths,
                         max_think_tokens,
                     )
                     profiler.mark("think_decode")
@@ -2677,24 +2731,30 @@ class NEOChatModel(PreTrainedModel):
                         past_key_values_condition,
                         prefix_hidden_states,
                         indexes_condition,
+                        condition_key_valid_mask,
+                        condition_prefix_lengths,
                     ) = self._replay_srt_think_prefix(
                         tokenizer,
                         input_ids_condition,
+                        condition_prefix_lengths,
                         think_token_ids,
                         IMG_START_TOKEN,
                     )
                     device = prefix_hidden_states.device
                     dtype = prefix_hidden_states.dtype
-                    t_index_condition = indexes_condition[0].max().item()
+                    think_text = think_texts[0] if len(prompts) == 1 else think_texts
                     del prefix_hidden_states, think_token_ids
                     profiler.mark("think_replay_prefill")
                     self.last_thinking_backend = "srt"
+                    self.last_thinking_backends = ["srt"] * len(prompts)
                     used_srt = True
                 except Exception as exc:
                     first_failure = thinking_backend.fail(exc)
                     if thinking_backend.strict:
                         # Benchmarks and CI require SRT; never measure the fallback.
                         raise
+                    if len(prompts) > 1:
+                        raise BatchedSRTThinkingFallbackRequired(str(exc)) from exc
                     if first_failure:
                         logger.warning(
                             "SenseNova SRT thinking is unavailable; this and later "
@@ -2725,12 +2785,22 @@ class NEOChatModel(PreTrainedModel):
                 )
                 profiler.mark("think_decode")
                 self.last_thinking_backend = "native"
+                self.last_thinking_backends = ["native"]
+                self.last_think_token_counts = [self.last_think_token_count]
                 if profile_stages:
                     profiler.timings_ms["think_replay_prefill"] = 0.0
+            if used_srt:
+                image_text_len = (
+                    int(condition_prefix_lengths[0].item())
+                    if len(prompts) == 1
+                    else condition_prefix_lengths
+                )
+            else:
+                image_text_len = t_index_condition + 1
             indexes_image_condition = self._build_t2i_image_indexes(
                 token_h,
                 token_w,
-                t_index_condition + 1,
+                image_text_len,
                 device=input_ids_condition.device,
             )
             if not used_srt:
