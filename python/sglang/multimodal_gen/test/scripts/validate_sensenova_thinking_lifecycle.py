@@ -162,11 +162,22 @@ def image_request(args):
 
 
 def run_probe(args, label):
-    """Run one request and keep its outcome; a failure is a result here."""
+    """Run one request and keep its outcome and duration; a failure is a result.
+
+    A failed request still has to be timed: in strict mode both requests fail,
+    and how long the second one took is what shows it no longer waits on SRT.
+    """
+    started = time.monotonic()
     try:
         result = image_request(args)
     except Exception as exc:  # noqa: BLE001 - both HTTP and transport errors are outcomes
-        return {"label": label, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        elapsed_ms = round((time.monotonic() - started) * 1000.0, 3)
+        return {
+            "label": label,
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_ms": elapsed_ms,
+        }
     return {"label": label, "ok": True, **result}
 
 
@@ -300,14 +311,18 @@ def phase_after_kill(args, output_dir):
         {"server_log": log_path, "count": len(error_lines), "lines": error_lines[:3]},
     )
     if args.failure_mode == "stop":
-        saved_ms = first.get("elapsed_ms", 0) - second.get("elapsed_ms", 0)
+        # The first request pays the SRT read timeout; the second must not, in
+        # either mode: the fallback answers natively, strict fails at once.
+        first_ms = first.get("elapsed_ms") or 0.0
+        second_ms = second.get("elapsed_ms") or 0.0
+        saved_ms = first_ms - second_ms
         check(
             checks,
             "later_requests_do_not_wait_again",
             saved_ms >= REPEAT_WAIT_FRACTION * args.srt_timeout_ms,
             {
-                "first_ms": first.get("elapsed_ms"),
-                "second_ms": second.get("elapsed_ms"),
+                "first_ms": first_ms,
+                "second_ms": second_ms,
                 "saved_ms": round(saved_ms, 3),
                 "expected_saved_ms": round(
                     REPEAT_WAIT_FRACTION * args.srt_timeout_ms, 3
