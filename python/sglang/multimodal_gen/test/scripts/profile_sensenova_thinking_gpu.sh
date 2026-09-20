@@ -39,7 +39,7 @@ trap cleanup EXIT INT TERM
   echo "budgets=${BUDGETS}"
   echo "thinking_backend=${SGLANG_SENSENOVA_THINKING_BACKEND:-srt}"
   echo "thinking_attention_backend=triton"
-  echo "thinking_mem_fraction=${SGLANG_SENSENOVA_THINKING_MEM_FRACTION:-0.3}"
+  echo "thinking_mem_fraction=${SGLANG_SENSENOVA_THINKING_MEM_FRACTION:-0.45}"
   echo "think_kv_cache=${SENSENOVA_THINK_KV_CACHE:-preallocated}"
   python -c 'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")'
   nvidia-smi

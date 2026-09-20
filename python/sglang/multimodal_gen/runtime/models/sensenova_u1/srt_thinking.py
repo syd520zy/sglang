@@ -169,7 +169,7 @@ def prepare_managed_srt_thinking(server_args):
         base_gpu_id=server_args.base_gpu_id,
         tp_size=1,
         mem_fraction_static=float(
-            os.environ.get("SGLANG_SENSENOVA_THINKING_MEM_FRACTION", "0.3")
+            os.environ.get("SGLANG_SENSENOVA_THINKING_MEM_FRACTION", "0.45")
         ),
         max_running_requests=8,
         cuda_graph_max_bs_decode=2,
