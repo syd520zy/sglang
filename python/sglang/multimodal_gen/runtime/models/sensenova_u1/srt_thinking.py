@@ -163,6 +163,7 @@ def prepare_managed_srt_thinking(server_args):
         port=port,
         trust_remote_code=True,
         dtype="bfloat16",
+        attention_backend="triton",
         context_length=4096,
         language_model_only=True,
         base_gpu_id=server_args.base_gpu_id,

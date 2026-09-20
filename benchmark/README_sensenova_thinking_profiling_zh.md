@@ -54,7 +54,7 @@ OUTPUT_DIR=/workspace/sensenova-thinking-profile-optimized \
   bash python/sglang/multimodal_gen/test/scripts/profile_sensenova_thinking_4090.sh
 ```
 
-两次运行使用相同提示词、种子和 token 上限。先检查 `profile/records.json` 的 `thinking_backend`：优化组应为 `srt`，如果是 `native`，说明内部服务启动或调用失败，实际测试的是回退路径。确认后再对比 `profile/summary.json` 中的 `think_decode_ms_per_token`，以及相同 case/seed 的 `think_text_sha256`。SRT 子服务由主服务自动启动，调用方仍只设置 `think_mode`；`--srt-encoder-url` 仅保留为外部部署覆盖项。官方 checkpoint 总大小约 35.1 GB，内部 SRT 还需约 18 GB 的稠密文本权重，因此 24/48 GB 4090 的权重容量本身就不足；启动失败时会自动回退原生路径，验证加速应换用 80 GB GPU。
+两次运行使用相同提示词、种子和 token 上限。先检查 `profile/records.json` 的 `thinking_backend`：优化组应为 `srt`，如果是 `native`，说明内部服务启动或调用失败，实际测试的是回退路径。确认后再对比 `profile/summary.json` 中的 `think_decode_ms_per_token`，以及相同 case/seed 的 `think_text_sha256`。SRT 子服务由主服务自动启动并固定使用 Triton attention，不依赖 FlashInfer attention 的版本；调用方仍只设置 `think_mode`，`--srt-encoder-url` 仅保留为外部部署覆盖项。官方 checkpoint 总大小约 35.1 GB，内部 SRT 还需约 18 GB 的稠密文本权重，因此 24/48 GB 4090 的权重容量本身就不足；启动失败时会自动回退原生路径，验证加速应换用 80 GB GPU。
 
 A800 上可用对照脚本一次完成原生路径、SRT 路径及结果比较。比较阶段会校验两组实际使用的后端；SRT 发生回退时脚本会失败并提示检查 `srt/server.log`。
 
