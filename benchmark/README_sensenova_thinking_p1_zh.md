@@ -18,12 +18,13 @@ bash benchmark/sensenova/update_repo.sh
 
 ## 2. P1-1 并发吞吐 A/B（native 对照 SRT）
 
-一次运行完成 native 基线、SRT 优化路径和比较，输出 `comparison.json`：
+一次运行完成 native 基线、SRT 优化路径和比较，输出 `comparison.json`。`STEPS_LIST` 是要逐一的
+去噪步数列表，每一项都会重启一对服务：
 
 ```bash
 cd /workspace/sglang
 
-CONCURRENCY="1 2" BUDGETS=64,128,256 REPEATS=2 \
+STEPS_LIST=10 CONCURRENCY="1 2" BUDGETS=64,128,256 REPEATS=2 \
 BATCHING_MAX_SIZE=2 BATCHING_DELAY_MS=50 \
   bash python/sglang/multimodal_gen/test/scripts/compare_sensenova_thinking_concurrency.sh
 ```
@@ -31,7 +32,7 @@ BATCHING_MAX_SIZE=2 BATCHING_DELAY_MS=50 \
 常用覆盖项：
 
 ```bash
-GPU_ID=0 SERVER_PORT=30000 WIDTH=1024 HEIGHT=1024 STEPS=10 \
+GPU_ID=0 SERVER_PORT=30000 WIDTH=1024 HEIGHT=1024 STEPS_LIST="10 50" \
 BUDGETS=64,128 CONCURRENCY="1 2 4" REPEATS=3 \
 OUTPUT_DIR=/workspace/sensenova-thinking-concurrency \
   bash python/sglang/multimodal_gen/test/scripts/compare_sensenova_thinking_concurrency.sh
