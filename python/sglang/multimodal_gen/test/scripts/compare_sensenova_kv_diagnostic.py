@@ -7,7 +7,36 @@ from pathlib import Path
 import torch
 
 
-def tensor_metrics(left: torch.Tensor, right: torch.Tensor) -> dict:
+def error_metrics(
+    left: torch.Tensor, right: torch.Tensor, *, atol: float, rtol: float
+) -> dict:
+    left = left.float()
+    right = right.float()
+    absolute = (left - right).abs()
+    denominator = torch.maximum(left.abs(), right.abs()).clamp_min(1e-6)
+    within_tolerance = absolute <= atol + rtol * right.abs()
+    quantiles = torch.quantile(
+        absolute.flatten(), torch.tensor([0.5, 0.95, 0.99, 0.999])
+    ).tolist()
+    return {
+        "max_abs_error": float(absolute.max().item()),
+        "mean_abs_error": float(absolute.mean().item()),
+        "abs_error_percentiles": {
+            name: float(value)
+            for name, value in zip(("p50", "p95", "p99", "p99.9"), quantiles)
+        },
+        "max_relative_error": float((absolute / denominator).max().item()),
+        "out_of_tolerance_count": int((~within_tolerance).sum().item()),
+        "out_of_tolerance_pct": float(
+            (~within_tolerance).float().mean().mul(100).item()
+        ),
+        "allclose": bool(within_tolerance.all().item()),
+    }
+
+
+def tensor_metrics(
+    left: torch.Tensor, right: torch.Tensor, *, atol: float, rtol: float
+) -> dict:
     shape_matches = left.shape == right.shape
     if not shape_matches:
         return {
@@ -22,10 +51,6 @@ def tensor_metrics(left: torch.Tensor, right: torch.Tensor) -> dict:
     native_dtype = str(left.dtype)
     srt_dtype = str(right.dtype)
     dtype_matches = left.dtype == right.dtype
-    left = left.float()
-    right = right.float()
-    absolute = (left - right).abs()
-    denominator = torch.maximum(left.abs(), right.abs()).clamp_min(1e-6)
     return {
         "native_shape": list(left.shape),
         "srt_shape": list(right.shape),
@@ -33,9 +58,7 @@ def tensor_metrics(left: torch.Tensor, right: torch.Tensor) -> dict:
         "srt_dtype": srt_dtype,
         "dtype_matches": dtype_matches,
         "shape_matches": True,
-        "max_abs_error": float(absolute.max().item()),
-        "mean_abs_error": float(absolute.mean().item()),
-        "max_relative_error": float((absolute / denominator).max().item()),
+        **error_metrics(left, right, atol=atol, rtol=rtol),
     }
 
 
@@ -61,19 +84,21 @@ def main() -> None:
     ):
         raise RuntimeError("native and SRT dump ids do not match")
 
-    keys = tensor_metrics(native["keys"], srt["keys"])
-    values = tensor_metrics(native["values"], srt["values"])
+    keys = tensor_metrics(native["keys"], srt["keys"], atol=args.atol, rtol=args.rtol)
+    values = tensor_metrics(
+        native["values"], srt["values"], atol=args.atol, rtol=args.rtol
+    )
     if keys["shape_matches"]:
-        keys["allclose"] = torch.allclose(
-            native["keys"].float(),
-            srt["keys"].float(),
+        half = native["keys"].shape[-1] // 2
+        keys["temporal_half"] = error_metrics(
+            native["keys"][..., :half],
+            srt["keys"][..., :half],
             atol=args.atol,
             rtol=args.rtol,
         )
-    if values["shape_matches"]:
-        values["allclose"] = torch.allclose(
-            native["values"].float(),
-            srt["values"].float(),
+        keys["spatial_half"] = error_metrics(
+            native["keys"][..., half:],
+            srt["keys"][..., half:],
             atol=args.atol,
             rtol=args.rtol,
         )

@@ -80,10 +80,19 @@ class SenseNovaU1Attention(Qwen3Attention):
         )
         assert self.head_dim % 2 == 0
         self.half_head_dim = self.head_dim // 2
-        self.q_norm = RMSNorm(self.half_head_dim, eps=config.rms_norm_eps)
-        self.q_norm_hw = RMSNorm(self.half_head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.half_head_dim, eps=config.rms_norm_eps)
-        self.k_norm_hw = RMSNorm(self.half_head_dim, eps=config.rms_norm_eps)
+        norm_kwargs = {"cast_x_before_out_mul": True}
+        self.q_norm = RMSNorm(
+            self.half_head_dim, eps=config.rms_norm_eps, **norm_kwargs
+        )
+        self.q_norm_hw = RMSNorm(
+            self.half_head_dim, eps=config.rms_norm_eps, **norm_kwargs
+        )
+        self.k_norm = RMSNorm(
+            self.half_head_dim, eps=config.rms_norm_eps, **norm_kwargs
+        )
+        self.k_norm_hw = RMSNorm(
+            self.half_head_dim, eps=config.rms_norm_eps, **norm_kwargs
+        )
         self.rotary_emb = get_rope(
             self.half_head_dim,
             rotary_dim=self.half_head_dim,

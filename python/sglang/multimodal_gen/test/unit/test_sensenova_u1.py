@@ -93,6 +93,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+from sglang.multimodal_gen.test.scripts.compare_sensenova_kv_diagnostic import (
+    error_metrics,
+)
 from sglang.multimodal_gen.test.scripts.inspect_sensenova_srt_runtime import (
     inspect_runtime_log,
 )
@@ -1622,6 +1625,19 @@ def test_sensenova_srt_worker_dumps_committed_nhd_kv(monkeypatch, tmp_path):
     assert payload["token_ids"] == [11, 12]
     torch.testing.assert_close(payload["keys"], keys[[3, 5]].transpose(0, 1))
     torch.testing.assert_close(payload["values"], values[[3, 5]].transpose(0, 1))
+
+
+def test_sensenova_kv_error_metrics_report_outliers():
+    metrics = error_metrics(
+        torch.tensor([0.0, 1.0]),
+        torch.tensor([0.04, 1.01]),
+        atol=0.03,
+        rtol=0.0,
+    )
+
+    assert metrics["out_of_tolerance_count"] == 1
+    assert metrics["out_of_tolerance_pct"] == 50.0
+    assert metrics["allclose"] is False
 
 
 def test_sensenova_srt_replay_pads_after_each_complete_prefix():
