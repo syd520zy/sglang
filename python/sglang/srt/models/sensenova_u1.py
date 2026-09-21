@@ -2,7 +2,9 @@
 """SRT text-only runtime for SenseNova-U1 thinking decode."""
 
 import hashlib
+import json
 import os
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -29,6 +31,105 @@ from sglang.srt.utils import add_prefix, is_cuda
 
 _KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
 _KV_DIAGNOSTIC_RID_PREFIX = "sensenova-kvdiag-"
+_KV_TRANSFER_DIR = "SGLANG_SENSENOVA_KV_TRANSFER_DIR"
+_KV_TRANSFER_RID_PREFIX = "sensenova-kvxfer-"
+
+
+def _atomic_json_dump(payload: dict, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _export_prefix_kv(
+    output_dir: str,
+    dump_id: str,
+    token_ids: list[int],
+    slots: torch.Tensor,
+    kv_pool,
+) -> None:
+    """Stream real paged KV through one pinned layer into a shared-memory file."""
+    layer_ids = list(
+        range(kv_pool.start_layer, kv_pool.start_layer + len(kv_pool.k_buffer))
+    )
+    first_keys, first_values = kv_pool.get_kv_buffer(layer_ids[0])
+    if first_keys.shape[1:] != first_values.shape[1:]:
+        raise RuntimeError("SenseNova KV transfer requires matching K/V shapes")
+    length = len(token_ids)
+    layer_shape = (first_keys.shape[1], length, first_keys.shape[2])
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    data_path = output / f"{dump_id}.bin"
+    temporary_data_path = output / f".{dump_id}.{os.getpid()}.bin.tmp"
+    total_elements = len(layer_ids) * 2 * layer_shape[0] * length * layer_shape[2]
+    with open(temporary_data_path, "wb") as handle:
+        handle.truncate(total_elements * first_keys.element_size())
+    mapped = torch.from_file(
+        str(temporary_data_path),
+        shared=True,
+        size=total_elements,
+        dtype=first_keys.dtype,
+    ).view(len(layer_ids), 2, *layer_shape)
+    pin_memory = first_keys.is_cuda
+    pinned_keys = torch.empty(
+        layer_shape, dtype=first_keys.dtype, pin_memory=pin_memory
+    )
+    pinned_values = torch.empty(
+        layer_shape, dtype=first_values.dtype, pin_memory=pin_memory
+    )
+    timings = {"gather": 0.0, "d2h": 0.0, "shared_write": 0.0}
+    events = None
+    if first_keys.is_cuda:
+        events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+
+    wall_started = time.perf_counter()
+    for output_layer, layer_id in enumerate(layer_ids):
+        keys, values = kv_pool.get_kv_buffer(layer_id)
+        if events is not None:
+            events[0].record()
+        else:
+            stage_started = time.perf_counter()
+        gathered_keys = keys.index_select(0, slots).transpose(0, 1)
+        gathered_values = values.index_select(0, slots).transpose(0, 1)
+        if events is not None:
+            events[1].record()
+            events[2].record()
+        else:
+            timings["gather"] += (time.perf_counter() - stage_started) * 1000
+            stage_started = time.perf_counter()
+        pinned_keys.copy_(gathered_keys, non_blocking=first_keys.is_cuda)
+        pinned_values.copy_(gathered_values, non_blocking=first_keys.is_cuda)
+        if events is not None:
+            events[3].record()
+            events[3].synchronize()
+            timings["gather"] += events[0].elapsed_time(events[1])
+            timings["d2h"] += events[2].elapsed_time(events[3])
+        else:
+            timings["d2h"] += (time.perf_counter() - stage_started) * 1000
+
+        stage_started = time.perf_counter()
+        mapped[output_layer, 0].copy_(pinned_keys)
+        mapped[output_layer, 1].copy_(pinned_values)
+        timings["shared_write"] += (time.perf_counter() - stage_started) * 1000
+
+    wall_ms = (time.perf_counter() - wall_started) * 1000
+    del mapped
+    os.replace(temporary_data_path, data_path)
+    metadata = {
+        "source": "srt",
+        "dump_id": dump_id,
+        "token_sha256": hashlib.sha256(
+            ",".join(map(str, token_ids)).encode()
+        ).hexdigest(),
+        "token_count": length,
+        "layer_ids": layer_ids,
+        "shape": [len(layer_ids), 2, *layer_shape],
+        "dtype": str(first_keys.dtype),
+        "data_file": data_path.name,
+        "data_bytes": total_elements * first_keys.element_size(),
+        "timings_ms": {**timings, "wall": wall_ms},
+    }
+    _atomic_json_dump(metadata, output / f"{dump_id}.json")
 
 
 def _understanding_weights(weights: Iterable[tuple[str, torch.Tensor]]):
@@ -218,31 +319,40 @@ class NEOChatModel(Qwen3ForCausalLM):
     def prepare_for_kv_cache_release(
         self, req, req_to_token_pool, token_to_kv_pool_allocator
     ) -> None:
-        """Dump one finalized prefix layer for the opt-in KV compatibility check."""
-        output_dir = os.environ.get(_KV_DIAGNOSTIC_DIR)
-        if (
-            not output_dir
-            or not isinstance(req.rid, str)
-            or not req.rid.startswith(_KV_DIAGNOSTIC_RID_PREFIX)
-        ):
+        """Export finalized prefix KV for explicitly marked diagnostic requests."""
+        if not isinstance(req.rid, str):
             return
-        dump_id = req.rid.removeprefix(_KV_DIAGNOSTIC_RID_PREFIX)
+        diagnostic = req.rid.startswith(_KV_DIAGNOSTIC_RID_PREFIX)
+        transfer = req.rid.startswith(_KV_TRANSFER_RID_PREFIX)
+        if not diagnostic and not transfer:
+            return
+        output_dir = os.environ.get(
+            _KV_DIAGNOSTIC_DIR if diagnostic else _KV_TRANSFER_DIR
+        )
+        if not output_dir:
+            return
+        prefix = _KV_DIAGNOSTIC_RID_PREFIX if diagnostic else _KV_TRANSFER_RID_PREFIX
+        dump_id = req.rid.removeprefix(prefix)
         if not dump_id or not dump_id.isascii() or not dump_id.isalnum():
-            raise ValueError(f"invalid SenseNova KV diagnostic id: {dump_id!r}")
+            raise ValueError(f"invalid SenseNova KV export id: {dump_id!r}")
         length = len(req.origin_input_ids)
         if not req.kv.holds_kv or length <= 0 or req.kv.kv_committed_len < length:
-            raise RuntimeError("SenseNova KV diagnostic request has no committed KV")
+            raise RuntimeError("SenseNova KV export request has no committed KV")
 
         kv_pool = token_to_kv_pool_allocator.get_kvcache()
         if getattr(kv_pool, "kv_cache_layout", None) != "nhd":
-            raise RuntimeError("SenseNova KV diagnostic requires an NHD KV cache")
+            raise RuntimeError("SenseNova KV export requires an NHD KV cache")
         if getattr(kv_pool, "is_quantized_kv_cache", False):
-            raise RuntimeError("SenseNova KV diagnostic requires an unquantized cache")
+            raise RuntimeError("SenseNova KV export requires an unquantized cache")
 
         slots = req_to_token_pool.req_to_token[req.kv.req_pool_idx, :length]
+        token_ids = [int(token_id) for token_id in req.origin_input_ids]
+        if transfer:
+            _export_prefix_kv(output_dir, dump_id, token_ids, slots, kv_pool)
+            return
+
         layer_id = kv_pool.start_layer
         keys, values = kv_pool.get_kv_buffer(layer_id)
-        token_ids = [int(token_id) for token_id in req.origin_input_ids]
         token_sha256 = hashlib.sha256(
             ",".join(map(str, token_ids)).encode()
         ).hexdigest()

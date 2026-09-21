@@ -104,6 +104,9 @@ from sglang.multimodal_gen.test.scripts.profile_sensenova_thinking_concurrency i
     summarize_wave,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.models.sensenova_u1 import (
+    _KV_TRANSFER_RID_PREFIX,
+)
 from sglang.srt.models.sensenova_u1 import NEOChatModel as SRTNEOChatModel
 from sglang.srt.models.sensenova_u1 import (
     _understanding_weights,
@@ -1626,6 +1629,53 @@ def test_sensenova_srt_worker_dumps_committed_nhd_kv(monkeypatch, tmp_path):
     assert payload["token_ids"] == [11, 12]
     torch.testing.assert_close(payload["keys"], keys[[3, 5]].transpose(0, 1))
     torch.testing.assert_close(payload["values"], values[[3, 5]].transpose(0, 1))
+
+
+def test_sensenova_srt_worker_streams_all_kv_layers(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", str(tmp_path))
+    keys = [
+        torch.arange(60, dtype=torch.bfloat16).reshape(10, 2, 3) + layer * 100
+        for layer in range(2)
+    ]
+    values = [key + 50 for key in keys]
+    pool = SimpleNamespace(
+        kv_cache_layout="nhd",
+        is_quantized_kv_cache=False,
+        start_layer=0,
+        k_buffer=keys,
+        get_kv_buffer=lambda layer_id: (keys[layer_id], values[layer_id]),
+    )
+    req = SimpleNamespace(
+        rid=f"{_KV_TRANSFER_RID_PREFIX}abc123",
+        origin_input_ids=[11, 12],
+        kv=SimpleNamespace(holds_kv=True, kv_committed_len=2, req_pool_idx=0),
+    )
+    req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([[3, 5]], dtype=torch.long)
+    )
+
+    SRTNEOChatModel.prepare_for_kv_cache_release(
+        None,
+        req,
+        req_to_token_pool,
+        SimpleNamespace(get_kvcache=lambda: pool),
+    )
+
+    metadata = json.loads((tmp_path / "abc123.json").read_text())
+    assert metadata["shape"] == [2, 2, 2, 2, 3]
+    exported = torch.from_file(
+        str(tmp_path / metadata["data_file"]),
+        shared=False,
+        size=48,
+        dtype=torch.bfloat16,
+    ).view(tuple(metadata["shape"]))
+    for layer in range(2):
+        torch.testing.assert_close(
+            exported[layer, 0], keys[layer][[3, 5]].transpose(0, 1)
+        )
+        torch.testing.assert_close(
+            exported[layer, 1], values[layer][[3, 5]].transpose(0, 1)
+        )
 
 
 def test_sensenova_kv_error_metrics_report_outliers():
