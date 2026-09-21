@@ -27,12 +27,14 @@ BATCHING_MAX_SIZE="${BATCHING_MAX_SIZE:-2}"
 BATCHING_DELAY_MS="${BATCHING_DELAY_MS:-50}"
 BATCHING_METRICS="${BATCHING_METRICS:-1}"
 RUN_UNIT_TESTS="${RUN_UNIT_TESTS:-0}"
+TRACE_GPU_MEMORY="${TRACE_GPU_MEMORY:-0}"
 
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export SGLANG_SENSENOVA_THINKING_RUNTIME_DIR="${OUTPUT_DIR}/thinking-runtime"
 
 SERVER_PID=""
+MEMORY_SAMPLER_PID=""
 cleanup() {
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
     python - "${SERVER_PID}" <<'PY' || kill "${SERVER_PID}" 2>/dev/null || true
@@ -45,6 +47,11 @@ PY
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
   SERVER_PID=""
+  if [[ -n "${MEMORY_SAMPLER_PID}" ]] && kill -0 "${MEMORY_SAMPLER_PID}" 2>/dev/null; then
+    kill -TERM "${MEMORY_SAMPLER_PID}" 2>/dev/null || true
+    wait "${MEMORY_SAMPLER_PID}" 2>/dev/null || true
+  fi
+  MEMORY_SAMPLER_PID=""
 }
 trap cleanup EXIT INT TERM
 
@@ -66,6 +73,7 @@ trap cleanup EXIT INT TERM
   echo "thinking_cuda_graph_max_bs=${SGLANG_SENSENOVA_THINKING_CUDA_GRAPH_MAX_BS:-2}"
   echo "thinking_context_length=4096"
   echo "thinking_runtime_dir=${SGLANG_SENSENOVA_THINKING_RUNTIME_DIR}"
+  echo "trace_gpu_memory=${TRACE_GPU_MEMORY}"
   python -c 'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")'
   nvidia-smi
 } >"${OUTPUT_DIR}/environment.txt" 2>&1
@@ -87,6 +95,14 @@ sglang serve --model-path "${MODEL_PATH}" --host 127.0.0.1 --port "${SERVER_PORT
   "${SERVER_ARGS[@]}" "$@" \
   >"${OUTPUT_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
+if [[ "${TRACE_GPU_MEMORY}" == "1" ]]; then
+  python "${SCRIPT_DIR}/sample_gpu_process_memory.py" \
+    --gpu-id "${GPU_ID}" \
+    --csv "${OUTPUT_DIR}/gpu-memory.csv" \
+    --summary "${OUTPUT_DIR}/gpu-memory-summary.json" \
+    >"${OUTPUT_DIR}/gpu-memory-sampler.log" 2>&1 &
+  MEMORY_SAMPLER_PID=$!
+fi
 deadline=$((SECONDS + 3600))
 until curl -fsS "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null 2>&1; do
   if ! kill -0 "${SERVER_PID}" 2>/dev/null || ((SECONDS >= deadline)); then
