@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
     _copy_right_aligned_prefix_bnsd,
+    _merge_srt_prefix_caches,
     _preallocate_think_cache,
     _randn_with_seed,
     prepare_flash_kv_cache,
@@ -1615,6 +1616,89 @@ def test_sensenova_srt_thinking_client_batches_token_requests(monkeypatch):
     assert request["json"]["input_ids"] == [[1, 2], [3]]
 
 
+def test_sensenova_srt_thinking_client_batches_sessions_for_kv_transfer(monkeypatch):
+    requests_seen = []
+    session_count = 0
+
+    class Response:
+        def __init__(self, payload=None):
+            self.payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.payload
+
+    def post(url, **kwargs):
+        nonlocal session_count
+        requests_seen.append((url, kwargs["json"]))
+        if url.endswith("/open_session"):
+            session_count += 1
+            return Response(f"session-{session_count}")
+        if url.endswith("/generate"):
+            output_ids = [7, 9] if kwargs["json"]["input_ids"] == [1, 2] else [6, 9]
+            return Response({"output_ids": output_ids})
+        return Response()
+
+    monkeypatch.setattr("requests.post", post)
+    client = SRTThinkingClient("http://127.0.0.1:1234", 3, 90)
+
+    output_ids, contexts = client.generate_batch_for_kv_transfer(
+        [[1, 2], [3]],
+        max_think_tokens=3,
+        eos_token_id=8,
+        think_end_token_id=9,
+    )
+
+    assert output_ids == [[7, 9], [6, 9]]
+    generate_requests = [
+        request for url, request in requests_seen if url.endswith("/generate")
+    ]
+    assert {tuple(request["input_ids"]) for request in generate_requests} == {
+        (1, 2),
+        (3,),
+    }
+    assert {request["session_params"]["id"] for request in generate_requests} == {
+        "session-1",
+        "session-2",
+    }
+    assert [context["session_id"] for context in contexts] == [
+        "session-1",
+        "session-2",
+    ]
+    client.close_transfer_context(contexts)
+    assert requests_seen[-2:] == [
+        ("http://127.0.0.1:1234/close_session", {"session_id": "session-1"}),
+        ("http://127.0.0.1:1234/close_session", {"session_id": "session-2"}),
+    ]
+
+
+def test_sensenova_merges_variable_length_srt_prefix_caches():
+    config = NEOLLMConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+    )
+    caches = []
+    for length, value in ((3, 1), (2, 2)):
+        cache = DynamicCache(config=config)
+        keys = torch.full((1, 2, length, 4), value, dtype=torch.bfloat16)
+        cache.update(keys, keys + 10, 0)
+        caches.append(cache)
+
+    merged = _merge_srt_prefix_caches(caches, [3, 2], config)
+
+    assert merged.layers[0].keys.shape == (2, 2, 3, 4)
+    assert torch.all(merged.layers[0].keys[0] == 1)
+    assert torch.all(merged.layers[0].keys[1, :, :2] == 2)
+    assert torch.all(merged.layers[0].keys[1, :, 2:] == 0)
+
+
 @pytest.mark.parametrize(
     ("raw_output", "expected_output", "expected_offset", "expected_suffix"),
     [
@@ -1967,6 +2051,68 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
     torch.testing.assert_close(cache.layers[1].keys, exported[1:2, 0])
     torch.testing.assert_close(cache.layers[1].values, exported[1:2, 1])
     assert not (tmp_path / "buffer.lock").exists()
+
+
+def test_sensenova_srt_replay_merges_batched_session_caches(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER", "1")
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", str(tmp_path))
+    config = NEOLLMConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+    )
+    contexts_seen = []
+
+    def import_prefix(_backend, token_ids, context):
+        contexts_seen.append(context)
+        cache = DynamicCache(config=config)
+        value = len(contexts_seen)
+        keys = torch.full((1, 2, len(token_ids), 4), value, dtype=torch.bfloat16)
+        cache.update(keys, keys + 10, 0)
+        return cache, {"session_reused_tokens": len(token_ids)}
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        language_model=SimpleNamespace(config=config),
+        _import_srt_prefix_tokens=import_prefix,
+        last_srt_kv_transferred_prefixes=[],
+    )
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.tensor([[20]])}
+
+    contexts = [{"session_id": "session-1"}, {"session_id": "session-2"}]
+    cache, hidden, *_ = NEOChatModel._replay_srt_think_prefix(
+        model,
+        Tokenizer(),
+        torch.tensor([[1, 2], [3, 0]]),
+        torch.tensor([2, 1]),
+        [[7, 9], [8, 9]],
+        "<img>",
+        SimpleNamespace(
+            transfer_prefix_kv=lambda *_args: None,
+            close_transfer_context=lambda _context: None,
+        ),
+        contexts,
+        require_transfer=True,
+    )
+
+    assert hidden is None
+    assert contexts_seen == contexts
+    assert cache.layers[0].keys.shape == (2, 2, 5, 4)
+    assert torch.all(cache.layers[0].keys[0] == 1)
+    assert torch.all(cache.layers[0].keys[1, :, :4] == 2)
+    assert torch.all(cache.layers[0].keys[1, :, 4:] == 0)
+    assert model.last_srt_kv_transfer_used is True
+    assert len(model.last_srt_kv_transfer_timings_list) == 2
 
 
 def test_sensenova_srt_imports_finalized_text_prefix_without_session(monkeypatch):

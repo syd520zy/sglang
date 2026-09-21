@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 import requests
@@ -358,70 +359,89 @@ class SRTThinkingClient:
         max_think_tokens: int,
         eos_token_id: int,
         think_end_token_id: int,
-    ) -> tuple[list[list[int]], dict]:
-        """Generate one response while retaining its SRT session for KV export."""
-        if len(input_ids) != 1:
-            raise ValueError("SenseNova KV transfer currently supports batch size 1")
-
+    ) -> tuple[list[list[int]], dict | list[dict]]:
+        """Generate responses while retaining one SRT session per KV export."""
         self.status.refresh()
         if self.status.state not in _SRT_SERVING_STATES:
             raise RuntimeError("SenseNova thinking SRT backend is unavailable")
 
-        session_id = None
+        session_ids = []
         try:
-            response = requests.post(
-                f"{self.url}/open_session",
-                json={"capacity_of_str_len": 16384},
-                timeout=(self.connect_timeout, self.timeout),
-            )
-            response.raise_for_status()
-            session_id = response.json()
-            if not isinstance(session_id, str) or not session_id:
-                raise TypeError("SenseNova thinking SRT returned an invalid session id")
+            for _ in input_ids:
+                response = requests.post(
+                    f"{self.url}/open_session",
+                    json={"capacity_of_str_len": 16384},
+                    timeout=(self.connect_timeout, self.timeout),
+                )
+                response.raise_for_status()
+                session_id = response.json()
+                if not isinstance(session_id, str) or not session_id:
+                    raise TypeError(
+                        "SenseNova thinking SRT returned an invalid session id"
+                    )
+                session_ids.append(session_id)
 
-            rid = f"sensenova-think-{time.time_ns():x}"
-            response = requests.post(
-                f"{self.url}/generate",
-                json={
-                    "rid": rid,
-                    "input_ids": input_ids[0],
-                    "session_params": {"id": session_id, "rid": None},
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": max(1, max_think_tokens - 1),
-                        "stop_token_ids": [eos_token_id, think_end_token_id],
-                        "no_stop_trim": True,
-                        "skip_special_tokens": False,
+            rids = [
+                f"sensenova-think-{time.time_ns():x}-{index}"
+                for index in range(len(input_ids))
+            ]
+
+            def generate(index):
+                response = requests.post(
+                    f"{self.url}/generate",
+                    json={
+                        "rid": rids[index],
+                        "input_ids": input_ids[index],
+                        "session_params": {"id": session_ids[index], "rid": None},
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": max(1, max_think_tokens - 1),
+                            "stop_token_ids": [eos_token_id, think_end_token_id],
+                            "no_stop_trim": True,
+                            "skip_special_tokens": False,
+                        },
                     },
-                },
-                timeout=(self.connect_timeout, self.timeout),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            output_ids = (
-                payload.get("output_ids") if isinstance(payload, dict) else None
-            )
-            if not isinstance(output_ids, list):
+                    timeout=(self.connect_timeout, self.timeout),
+                )
+                response.raise_for_status()
+                return response.json()
+
+            with ThreadPoolExecutor(max_workers=len(input_ids)) as executor:
+                responses = list(executor.map(generate, range(len(input_ids))))
+            output_ids = [
+                item.get("output_ids") if isinstance(item, dict) else None
+                for item in responses
+            ]
+            if not all(isinstance(item, list) for item in output_ids):
                 raise TypeError("SenseNova thinking SRT response has no session result")
         except (requests.RequestException, ValueError, TypeError) as exc:
-            if session_id is not None:
+            for session_id in session_ids:
                 self._close_session(session_id)
             self.fail(exc)
             raise
 
-        normalized = normalize_thinking_output_ids(
-            output_ids,
-            max_think_tokens=max_think_tokens,
-            eos_token_id=eos_token_id,
-            think_end_token_id=think_end_token_id,
-        )
+        normalized = [
+            normalize_thinking_output_ids(
+                item,
+                max_think_tokens=max_think_tokens,
+                eos_token_id=eos_token_id,
+                think_end_token_id=think_end_token_id,
+            )
+            for item in output_ids
+        ]
+        contexts = [
+            {
+                "session_id": session_id,
+                "parent_rid": rid,
+                "input_ids": list(row),
+                "output_ids": [int(token_id) for token_id in output],
+            }
+            for session_id, rid, row, output in zip(
+                session_ids, rids, input_ids, output_ids
+            )
+        ]
         self.status.mark_ready()
-        return [normalized], {
-            "session_id": session_id,
-            "parent_rid": rid,
-            "input_ids": list(input_ids[0]),
-            "output_ids": [int(token_id) for token_id in output_ids],
-        }
+        return normalized, contexts[0] if len(contexts) == 1 else contexts
 
     def dump_prefix_kv(self, input_ids: list[int], dump_id: str) -> None:
         """Prefill one finalized replay prefix so SRT can dump diagnostic KV."""
@@ -535,8 +555,12 @@ class SRTThinkingClient:
                 f"{metadata_path}"
             ) from exc
 
-    def close_transfer_context(self, session_context: dict | None) -> None:
+    def close_transfer_context(self, session_context: dict | list[dict] | None) -> None:
         if not session_context:
+            return
+        if isinstance(session_context, list):
+            for context in session_context:
+                self.close_transfer_context(context)
             return
         session_id = session_context.pop("session_id", None)
         if session_id is not None:

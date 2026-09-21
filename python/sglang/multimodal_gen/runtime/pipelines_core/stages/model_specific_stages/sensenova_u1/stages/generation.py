@@ -202,7 +202,14 @@ class SenseNovaU1GenerationStage(PipelineStage):
             if transferred_prefixes:
                 usage["srt_kv_transfer_used"] = True
                 usage["srt_kv_transferred_prefixes"] = list(transferred_prefixes)
-                transfer = getattr(self.model, "last_srt_kv_transfer_timings", {})
+                transfer_list = getattr(
+                    self.model, "last_srt_kv_transfer_timings_list", []
+                )
+                transfer = (
+                    transfer_list[index]
+                    if index < len(transfer_list)
+                    else getattr(self.model, "last_srt_kv_transfer_timings", {})
+                )
                 usage["srt_kv_session_reused_tokens"] = transfer.get(
                     "session_reused_tokens"
                 )

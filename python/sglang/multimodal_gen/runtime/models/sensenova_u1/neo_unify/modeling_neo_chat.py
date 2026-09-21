@@ -170,6 +170,35 @@ def _load_srt_prefix_kv(
             path.unlink(missing_ok=True)
 
 
+def _merge_srt_prefix_caches(caches, lengths, config):
+    if len(caches) != len(lengths) or not caches:
+        raise ValueError("SenseNova SRT cache batch does not match prefix lengths")
+    if len(caches) == 1:
+        return caches[0]
+
+    max_length = max(lengths)
+    merged = DynamicCache(config=config)
+    layer_count = len(caches[0].layers)
+    if any(len(cache.layers) != layer_count for cache in caches):
+        raise ValueError("SenseNova SRT cache batches have different layer counts")
+    for layer_index in range(layer_count):
+        sample = caches[0].layers[layer_index]
+        keys = sample.keys.new_zeros(
+            (len(caches), sample.keys.shape[1], max_length, sample.keys.shape[3])
+        )
+        values = sample.values.new_zeros(
+            (len(caches), sample.values.shape[1], max_length, sample.values.shape[3])
+        )
+        for batch_index, (cache, length) in enumerate(zip(caches, lengths)):
+            layer = cache.layers[layer_index]
+            if layer.keys.shape[0] != 1 or layer.keys.shape[2] != length:
+                raise ValueError("SenseNova SRT cache has an invalid prefix shape")
+            keys[batch_index, :, :length].copy_(layer.keys[0])
+            values[batch_index, :, :length].copy_(layer.values[0])
+        merged.update(keys, values, layer_index)
+    return merged
+
+
 class _SenseNovaPreallocatedLayer(DynamicLayer):
     def __init__(self, layer: DynamicLayer, capacity: int):
         super().__init__()
@@ -983,7 +1012,6 @@ class NEOChatModel(PreTrainedModel):
             os.environ.get(_USE_SRT_KV_TRANSFER) == "1"
             and not os.environ.get(_KV_DIAGNOSTIC_DIR)
             and os.environ.get(_KV_TRANSFER_DIR)
-            and len(request_ids) == 1
             and hasattr(thinking_backend, "generate_batch_for_kv_transfer")
         ):
             output_ids, transfer_context = (
@@ -1057,6 +1085,36 @@ class NEOChatModel(PreTrainedModel):
                 exc,
             )
             return None, {}
+
+    def _try_import_srt_text_prefix_batch(
+        self,
+        thinking_backend,
+        input_ids,
+        prefix_lengths,
+        name,
+    ):
+        caches = []
+        timings = []
+        lengths = [int(length) for length in prefix_lengths.tolist()]
+        try:
+            for index, length in enumerate(lengths):
+                cache, row_timings = self._import_srt_prefix_tokens(
+                    thinking_backend,
+                    input_ids[index, :length].tolist(),
+                )
+                caches.append(cache)
+                timings.append(row_timings)
+            return (
+                _merge_srt_prefix_caches(caches, lengths, self.language_model.config),
+                timings,
+            )
+        except Exception as exc:
+            logger.warning(
+                "SenseNova SRT %s KV transfer failed; running the native prefix: %s",
+                name,
+                exc,
+            )
+            return None, []
 
     def _replay_srt_think_prefix(
         self,
@@ -1139,26 +1197,42 @@ class NEOChatModel(PreTrainedModel):
             "full_attention": create_block_causal_mask(t_idx, key_valid_mask)
         }
         cache = hidden_states = None
+        transfer_contexts = (
+            transfer_context
+            if isinstance(transfer_context, list)
+            else [transfer_context]
+        )
         use_transfer = (
             os.environ.get(_USE_SRT_KV_TRANSFER) == "1"
             and diagnostic_dir is None
-            and len(replay_rows) == 1
             and thinking_backend is not None
             and hasattr(thinking_backend, "transfer_prefix_kv")
-            and transfer_context is not None
+            and all(context is not None for context in transfer_contexts)
+            and len(transfer_contexts) == len(replay_rows)
         )
         if use_transfer:
             try:
-                cache, self.last_srt_kv_transfer_timings = (
-                    self._import_srt_prefix_tokens(
+                caches = []
+                transfer_timings = []
+                for row, context in zip(replay_rows, transfer_contexts):
+                    row_cache, row_timings = self._import_srt_prefix_tokens(
                         thinking_backend,
-                        replay_rows[0].tolist(),
-                        transfer_context,
+                        row.tolist(),
+                        context,
                     )
+                    caches.append(row_cache)
+                    transfer_timings.append(row_timings)
+                cache = _merge_srt_prefix_caches(
+                    caches,
+                    replay_lengths.tolist(),
+                    self.language_model.config,
                 )
+                self.last_srt_kv_transfer_timings_list = transfer_timings
+                self.last_srt_kv_transfer_timings = transfer_timings[0]
                 self.last_srt_kv_transfer_used = True
                 self.last_srt_kv_transferred_prefixes.append("condition")
             except Exception as exc:
+                thinking_backend.close_transfer_context(transfer_contexts)
                 self.last_srt_kv_transfer_used = False
                 if require_transfer:
                     raise RuntimeError(
@@ -2888,6 +2962,7 @@ class NEOChatModel(PreTrainedModel):
         self.last_thinking_backend = None
         self.last_srt_kv_transfer_used = False
         self.last_srt_kv_transfer_timings = {}
+        self.last_srt_kv_transfer_timings_list = []
         self.last_srt_kv_transferred_prefixes = []
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
@@ -2904,15 +2979,18 @@ class NEOChatModel(PreTrainedModel):
             os.environ.get(_USE_SRT_KV_TRANSFER) == "1"
             and not os.environ.get(_KV_DIAGNOSTIC_DIR)
             and os.environ.get(_KV_TRANSFER_DIR)
-            and len(prompts) == 1
             and thinking_backend is not None
             and hasattr(thinking_backend, "transfer_prefix_kv")
         )
         compact_mode = getattr(self, "_sensenova_compact_mode", False)
+        if compact_mode and len(prompts) > 2:
+            raise RuntimeError(
+                "SenseNova compact mode supports at most two T2I prompts"
+            )
         if compact_mode and not use_direct_srt_prefix:
             raise RuntimeError(
-                "SenseNova compact mode requires one T2I prompt and the managed "
-                "SRT prefix KV transfer backend"
+                "SenseNova compact mode requires the managed SRT prefix KV transfer "
+                "backend"
             )
         self._notify_layer_offload_phase("prefix")
         merge_size = int(1 / self.downsample_ratio)
@@ -3097,15 +3175,33 @@ class NEOChatModel(PreTrainedModel):
         else:
             past_key_values_condition = None
             if use_direct_srt_prefix:
-                (
-                    past_key_values_condition,
-                    self.last_srt_kv_transfer_timings,
-                ) = self._try_import_srt_text_prefix(
-                    thinking_backend,
-                    input_ids_condition,
-                    condition_prefix_lengths[0],
-                    "condition",
-                )
+                if len(prompts) == 1:
+                    (
+                        past_key_values_condition,
+                        self.last_srt_kv_transfer_timings,
+                    ) = self._try_import_srt_text_prefix(
+                        thinking_backend,
+                        input_ids_condition,
+                        condition_prefix_lengths[0],
+                        "condition",
+                    )
+                    self.last_srt_kv_transfer_timings_list = [
+                        self.last_srt_kv_transfer_timings
+                    ]
+                else:
+                    (
+                        past_key_values_condition,
+                        self.last_srt_kv_transfer_timings_list,
+                    ) = self._try_import_srt_text_prefix_batch(
+                        thinking_backend,
+                        input_ids_condition,
+                        condition_prefix_lengths,
+                        "condition",
+                    )
+                    if self.last_srt_kv_transfer_timings_list:
+                        self.last_srt_kv_transfer_timings = (
+                            self.last_srt_kv_transfer_timings_list[0]
+                        )
                 self.last_srt_kv_transfer_used = past_key_values_condition is not None
                 if self.last_srt_kv_transfer_used:
                     self.last_srt_kv_transferred_prefixes.append("condition")
@@ -3153,6 +3249,8 @@ class NEOChatModel(PreTrainedModel):
                     self.last_srt_kv_transfer_timings["uncondition"] = (
                         uncondition_transfer_timings
                     )
+                    for row_timings in self.last_srt_kv_transfer_timings_list:
+                        row_timings["uncondition"] = uncondition_transfer_timings
                 elif compact_mode:
                     raise RuntimeError(
                         "SenseNova compact mode did not receive the CFG prefix KV"
