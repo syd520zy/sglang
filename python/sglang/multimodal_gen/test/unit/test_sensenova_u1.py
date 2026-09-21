@@ -2432,6 +2432,13 @@ def test_sensenova_compact_mode_prunes_only_dense_language_weights():
     assert layer.self_attn.q_proj_mot_gen is not None
 
 
+def test_sensenova_compact_mode_rejects_it2i():
+    model = SimpleNamespace(_sensenova_compact_mode=True)
+
+    with pytest.raises(RuntimeError, match="text-to-image only"):
+        NEOChatModel.it2i_generate(model, None, "prompt", [])
+
+
 def test_sensenova_thinking_runtime_files_honor_the_log_override(tmp_path, monkeypatch):
     runtime_dir = tmp_path / "runtime"
     log_file = tmp_path / "logs" / "srt.log"
