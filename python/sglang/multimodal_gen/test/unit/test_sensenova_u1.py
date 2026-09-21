@@ -1569,6 +1569,78 @@ def test_sensenova_srt_thinking_client_batches_token_requests(monkeypatch):
     assert request["json"]["input_ids"] == [[1, 2], [3]]
 
 
+@pytest.mark.parametrize(
+    ("raw_output", "expected_output", "expected_offset", "expected_suffix"),
+    [
+        ([7, 9], [7, 9], 4, [20]),
+        ([7, 8], [7, 9], 3, [9, 20]),
+        ([7, 6], [7, 6, 9], 4, [9, 20]),
+    ],
+)
+def test_sensenova_srt_thinking_client_reuses_session_for_kv_transfer(
+    monkeypatch,
+    tmp_path,
+    raw_output,
+    expected_output,
+    expected_offset,
+    expected_suffix,
+):
+    requests_seen = []
+
+    class Response:
+        def __init__(self, payload=None):
+            self.payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.payload
+
+    def post(url, **kwargs):
+        requests_seen.append((url, kwargs["json"]))
+        if url.endswith("/open_session"):
+            return Response("session-1")
+        if url.endswith("/close_session"):
+            return Response()
+        if kwargs["json"]["rid"].startswith("sensenova-think-"):
+            return Response({"output_ids": raw_output, "meta_info": {}})
+
+        dump_id = kwargs["json"]["rid"].removeprefix("sensenova-kvxfer-")
+        (tmp_path / f"{dump_id}.json").write_text(
+            json.dumps({"dump_id": dump_id}), encoding="utf-8"
+        )
+        return Response(
+            {
+                "output_ids": [3],
+                "meta_info": {"id": kwargs["json"]["rid"], "cached_tokens": 3},
+            }
+        )
+
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", str(tmp_path))
+    monkeypatch.setattr("requests.post", post)
+    client = SRTThinkingClient("http://127.0.0.1:1234", 3, 90)
+
+    output_ids, context = client.generate_batch_for_kv_transfer(
+        [[1, 2]], max_think_tokens=3, eos_token_id=8, think_end_token_id=9
+    )
+    final_prefix = [1, 2, *expected_output, 20]
+    metadata = client.transfer_prefix_kv(final_prefix, "abc123", context)
+
+    assert output_ids == [expected_output]
+    continuation = requests_seen[2][1]
+    assert continuation["input_ids"] == expected_suffix
+    assert continuation["session_params"]["id"] == "session-1"
+    assert continuation["session_params"]["rid"].startswith("sensenova-think-")
+    assert continuation["session_params"]["offset"] == expected_offset
+    assert requests_seen[3] == (
+        "http://127.0.0.1:1234/close_session",
+        {"session_id": "session-1"},
+    )
+    assert metadata["session_reused_tokens"] == expected_offset
+    assert metadata["request_meta_info"]["cached_tokens"] == 3
+
+
 def test_sensenova_srt_client_requests_diagnostic_prefix(monkeypatch, tmp_path):
     request = {}
 
@@ -1771,7 +1843,8 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
     exported = torch.arange(96, dtype=torch.bfloat16).reshape(1, 2, 2, 6, 4)
 
     class Backend:
-        def transfer_prefix_kv(self, token_ids, dump_id):
+        def transfer_prefix_kv(self, token_ids, dump_id, session_context):
+            assert session_context == {"session_id": "session-1"}
             data_path = tmp_path / "buffer.bin"
             with open(data_path, "wb") as handle:
                 handle.truncate(exported.numel() * exported.element_size())
@@ -1825,6 +1898,7 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
         [[7, 9]],
         "<img>",
         Backend(),
+        {"session_id": "session-1"},
     )
 
     assert hidden is None
@@ -1840,7 +1914,7 @@ def test_sensenova_srt_kv_transfer_failure_replays_prefix(monkeypatch, tmp_path)
     expected_cache = object()
 
     class Backend:
-        def transfer_prefix_kv(self, _token_ids, _dump_id):
+        def transfer_prefix_kv(self, _token_ids, _dump_id, _session_context):
             raise RuntimeError("transfer failed")
 
     model = SimpleNamespace(
@@ -1867,6 +1941,7 @@ def test_sensenova_srt_kv_transfer_failure_replays_prefix(monkeypatch, tmp_path)
         [[7, 9]],
         "<img>",
         Backend(),
+        {"session_id": "session-1"},
     )
 
     assert cache is expected_cache

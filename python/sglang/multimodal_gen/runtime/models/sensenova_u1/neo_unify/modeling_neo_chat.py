@@ -142,6 +142,10 @@ def _load_srt_prefix_kv(
             "h2d": h2d_ms,
             "import_wall": (time.perf_counter() - wall_started) * 1000,
             "export": metadata.get("timings_ms") or {},
+            "session_reused_tokens": metadata.get("session_reused_tokens"),
+            "srt_cached_tokens": (metadata.get("request_meta_info") or {}).get(
+                "cached_tokens"
+            ),
         }
         return cache, timings
     finally:
@@ -957,17 +961,45 @@ class NEOChatModel(PreTrainedModel):
             input_ids[index, : int(length)].tolist()
             for index, length in enumerate(prefix_lengths.tolist())
         ]
-        output_ids = thinking_backend.generate_batch(
-            request_ids,
-            max_think_tokens=max_think_tokens,
-            eos_token_id=eos_token_id,
-            think_end_token_id=think_end_token_id,
-        )
+        transfer_context = None
+        if (
+            os.environ.get(_USE_SRT_KV_TRANSFER) == "1"
+            and not os.environ.get(_KV_DIAGNOSTIC_DIR)
+            and os.environ.get(_KV_TRANSFER_DIR)
+            and len(request_ids) == 1
+            and hasattr(thinking_backend, "generate_batch_for_kv_transfer")
+        ):
+            output_ids, transfer_context = (
+                thinking_backend.generate_batch_for_kv_transfer(
+                    request_ids,
+                    max_think_tokens=max_think_tokens,
+                    eos_token_id=eos_token_id,
+                    think_end_token_id=think_end_token_id,
+                )
+            )
+        else:
+            output_ids = thinking_backend.generate_batch(
+                request_ids,
+                max_think_tokens=max_think_tokens,
+                eos_token_id=eos_token_id,
+                think_end_token_id=think_end_token_id,
+            )
         self.last_think_token_counts = [len(item) for item in output_ids]
         self.last_think_token_count = self.last_think_token_counts[0]
-        return output_ids, [
-            tokenizer.decode(item, skip_special_tokens=False) for item in output_ids
-        ]
+        try:
+            think_texts = [
+                tokenizer.decode(item, skip_special_tokens=False) for item in output_ids
+            ]
+        # The retained session must close for every tokenizer failure type.
+        except Exception:  # noqa: BLE001
+            if hasattr(thinking_backend, "close_transfer_context"):
+                thinking_backend.close_transfer_context(transfer_context)
+            raise
+        return (
+            output_ids,
+            think_texts,
+            transfer_context,
+        )
 
     def _replay_srt_think_prefix(
         self,
@@ -977,6 +1009,7 @@ class NEOChatModel(PreTrainedModel):
         think_token_ids,
         IMG_START_TOKEN,
         thinking_backend=None,
+        transfer_context=None,
     ):
         append_ids = tokenizer(
             "\n\n" + IMG_START_TOKEN,
@@ -1054,6 +1087,7 @@ class NEOChatModel(PreTrainedModel):
             and len(replay_rows) == 1
             and thinking_backend is not None
             and hasattr(thinking_backend, "transfer_prefix_kv")
+            and transfer_context is not None
         )
         if use_transfer:
             transfer_id = (
@@ -1061,7 +1095,7 @@ class NEOChatModel(PreTrainedModel):
             )
             try:
                 metadata = thinking_backend.transfer_prefix_kv(
-                    replay_rows[0].tolist(), transfer_id
+                    replay_rows[0].tolist(), transfer_id, transfer_context
                 )
                 cache, self.last_srt_kv_transfer_timings = _load_srt_prefix_kv(
                     metadata,
@@ -2878,9 +2912,14 @@ class NEOChatModel(PreTrainedModel):
         if think_mode:
             used_srt = False
             if thinking_backend is not None:
+                transfer_context = None
                 profiler.mark("condition_prefill")
                 try:
-                    think_token_ids, think_texts = self._request_srt_think_tokens(
+                    (
+                        think_token_ids,
+                        think_texts,
+                        transfer_context,
+                    ) = self._request_srt_think_tokens(
                         tokenizer,
                         thinking_backend,
                         input_ids_condition,
@@ -2901,6 +2940,7 @@ class NEOChatModel(PreTrainedModel):
                         think_token_ids,
                         IMG_START_TOKEN,
                         thinking_backend,
+                        transfer_context,
                     )
                     first_cache_layer = past_key_values_condition.layers[0]
                     device = first_cache_layer.keys.device
@@ -2912,6 +2952,8 @@ class NEOChatModel(PreTrainedModel):
                     self.last_thinking_backends = ["srt"] * len(prompts)
                     used_srt = True
                 except Exception as exc:
+                    if hasattr(thinking_backend, "close_transfer_context"):
+                        thinking_backend.close_transfer_context(transfer_context)
                     first_failure = thinking_backend.fail(exc)
                     if thinking_backend.strict:
                         # Benchmarks and CI require SRT; never measure the fallback.

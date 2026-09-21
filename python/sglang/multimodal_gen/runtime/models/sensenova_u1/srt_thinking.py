@@ -307,6 +307,78 @@ class SRTThinkingClient:
             for item in output_ids
         ]
 
+    def generate_batch_for_kv_transfer(
+        self,
+        input_ids: list[list[int]],
+        *,
+        max_think_tokens: int,
+        eos_token_id: int,
+        think_end_token_id: int,
+    ) -> tuple[list[list[int]], dict]:
+        """Generate one response while retaining its SRT session for KV export."""
+        if len(input_ids) != 1:
+            raise ValueError("SenseNova KV transfer currently supports batch size 1")
+
+        self.status.refresh()
+        if self.status.state not in _SRT_SERVING_STATES:
+            raise RuntimeError("SenseNova thinking SRT backend is unavailable")
+
+        session_id = None
+        try:
+            response = requests.post(
+                f"{self.url}/open_session",
+                json={"capacity_of_str_len": 16384},
+                timeout=(self.connect_timeout, self.timeout),
+            )
+            response.raise_for_status()
+            session_id = response.json()
+            if not isinstance(session_id, str) or not session_id:
+                raise TypeError("SenseNova thinking SRT returned an invalid session id")
+
+            rid = f"sensenova-think-{time.time_ns():x}"
+            response = requests.post(
+                f"{self.url}/generate",
+                json={
+                    "rid": rid,
+                    "input_ids": input_ids[0],
+                    "session_params": {"id": session_id, "rid": None},
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": max(1, max_think_tokens - 1),
+                        "stop_token_ids": [eos_token_id, think_end_token_id],
+                        "no_stop_trim": True,
+                        "skip_special_tokens": False,
+                    },
+                },
+                timeout=(self.connect_timeout, self.timeout),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            output_ids = (
+                payload.get("output_ids") if isinstance(payload, dict) else None
+            )
+            if not isinstance(output_ids, list):
+                raise TypeError("SenseNova thinking SRT response has no session result")
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            if session_id is not None:
+                self._close_session(session_id)
+            self.fail(exc)
+            raise
+
+        normalized = normalize_thinking_output_ids(
+            output_ids,
+            max_think_tokens=max_think_tokens,
+            eos_token_id=eos_token_id,
+            think_end_token_id=think_end_token_id,
+        )
+        self.status.mark_ready()
+        return [normalized], {
+            "session_id": session_id,
+            "parent_rid": rid,
+            "input_ids": list(input_ids[0]),
+            "output_ids": [int(token_id) for token_id in output_ids],
+        }
+
     def dump_prefix_kv(self, input_ids: list[int], dump_id: str) -> None:
         """Prefill one finalized replay prefix so SRT can dump diagnostic KV."""
         if not os.environ.get(_ENV_KV_DIAGNOSTIC_DIR):
@@ -330,29 +402,77 @@ class SRTThinkingClient:
             self.fail(exc)
             raise
 
-    def transfer_prefix_kv(self, input_ids: list[int], dump_id: str) -> dict:
+    def transfer_prefix_kv(
+        self, input_ids: list[int], dump_id: str, session_context: dict | None = None
+    ) -> dict:
         """Ask SRT to export a finalized prefix and return its transfer metadata."""
         output_dir = os.environ.get(_ENV_KV_TRANSFER_DIR)
         if not output_dir:
+            self.close_transfer_context(session_context)
             raise RuntimeError(f"{_ENV_KV_TRANSFER_DIR} is not configured")
-        response = requests.post(
-            f"{self.url}/generate",
-            json={
-                "rid": f"{_KV_TRANSFER_RID_PREFIX}{dump_id}",
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 1,
-                    "skip_special_tokens": False,
-                },
+        request = {
+            "rid": f"{_KV_TRANSFER_RID_PREFIX}{dump_id}",
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 1,
+                "skip_special_tokens": False,
             },
-            timeout=(self.connect_timeout, self.timeout),
-        )
-        response.raise_for_status()
+        }
+        session_id = None
+        reused_tokens = 0
+        if session_context is not None:
+            session_id = session_context["session_id"]
+            previous_ids = session_context["input_ids"] + session_context["output_ids"]
+            reused_tokens = next(
+                (
+                    index
+                    for index, (previous, current) in enumerate(
+                        zip(previous_ids, input_ids)
+                    )
+                    if previous != current
+                ),
+                min(len(previous_ids), len(input_ids)),
+            )
+            if reused_tokens <= 0:
+                self.close_transfer_context(session_context)
+                raise RuntimeError(
+                    "SenseNova SRT session does not share the expected prefix"
+                )
+            request["input_ids"] = input_ids[reused_tokens:]
+            request["session_params"] = {
+                "id": session_id,
+                "rid": session_context["parent_rid"],
+                "offset": reused_tokens,
+            }
+        try:
+            response = requests.post(
+                f"{self.url}/generate",
+                json=request,
+                timeout=(self.connect_timeout, self.timeout),
+            )
+            response.raise_for_status()
+            response_payload = response.json()
+        finally:
+            self.close_transfer_context(session_context)
         metadata_path = os.path.join(output_dir, f"{dump_id}.json")
         try:
             with open(metadata_path, encoding="utf-8") as handle:
-                return json.load(handle)
+                metadata = json.load(handle)
+            meta_info = (
+                response_payload.get("meta_info")
+                if isinstance(response_payload, dict)
+                else None
+            )
+            metadata["session_reused_tokens"] = reused_tokens
+            metadata["request_meta_info"] = meta_info or {}
+            logger.info(
+                "SenseNova SRT KV session reused %d prefix tokens; SRT reported "
+                "cached_tokens=%s",
+                reused_tokens,
+                (meta_info or {}).get("cached_tokens"),
+            )
+            return metadata
         except (OSError, ValueError) as exc:
             lock_path = os.path.join(output_dir, "buffer.lock")
             try:
@@ -370,6 +490,24 @@ class SRTThinkingClient:
                 f"SenseNova SRT response completed without valid KV metadata: "
                 f"{metadata_path}"
             ) from exc
+
+    def close_transfer_context(self, session_context: dict | None) -> None:
+        if not session_context:
+            return
+        session_id = session_context.pop("session_id", None)
+        if session_id is not None:
+            self._close_session(session_id)
+
+    def _close_session(self, session_id: str) -> None:
+        try:
+            response = requests.post(
+                f"{self.url}/close_session",
+                json={"session_id": session_id},
+                timeout=(self.connect_timeout, self.timeout),
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("SenseNova thinking SRT session cleanup failed: %s", exc)
 
     def fail(self, exc: BaseException) -> bool:
         """Mark SRT unusable; True when this was its first failure on this client."""

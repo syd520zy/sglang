@@ -198,6 +198,11 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 )
                 if getattr(self.model, "last_srt_kv_transfer_used", False):
                     usage["srt_kv_transfer_used"] = True
+                    transfer = getattr(self.model, "last_srt_kv_transfer_timings", {})
+                    usage["srt_kv_session_reused_tokens"] = transfer.get(
+                        "session_reused_tokens"
+                    )
+                    usage["srt_kv_cached_tokens"] = transfer.get("srt_cached_tokens")
             if options.profile_stages:
                 usage["stage_timings_ms"] = (
                     per_request_timings[index]

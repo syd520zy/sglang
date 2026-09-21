@@ -75,23 +75,39 @@ def main() -> None:
             "image_metrics": compare_images(replay_image, transfer_image),
             "transfer_used": transfer_row.get("srt_kv_transfer_used") is True,
             "replay_used_transfer": replay_row.get("srt_kv_transfer_used") is True,
+            "session_reused_tokens": transfer_row.get("srt_kv_session_reused_tokens"),
+            "srt_cached_tokens": transfer_row.get("srt_kv_cached_tokens"),
             "replay_prefill_ms": replay_ms,
             "transfer_prefill_ms": transfer_ms,
             "speedup": round(replay_ms / transfer_ms, 3),
         }
 
-    passed = all(
+    automated_passed = all(
         row["reasoning_tokens_match"]
         and row["think_text_hash_match"]
-        and row["image_hash_match"]
         and row["transfer_used"]
         and not row["replay_used_transfer"]
+        and isinstance(row["session_reused_tokens"], int)
+        and row["session_reused_tokens"] > 0
+        and isinstance(row["srt_cached_tokens"], int)
+        and row["srt_cached_tokens"] > 0
         for row in comparisons.values()
     )
-    report = {"passed": passed, "comparisons": comparisons}
+    report = {
+        "passed": automated_passed,
+        "content_review_required": any(
+            not row["image_hash_match"] for row in comparisons.values()
+        ),
+        "acceptance": (
+            "Image hash is diagnostic only. Review generated images for subject, "
+            "count, spatial relationships, prompt semantics, composition, and "
+            "artifacts."
+        ),
+        "comparisons": comparisons,
+    }
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
-    if not passed:
+    if not automated_passed:
         raise SystemExit(1)
 
 

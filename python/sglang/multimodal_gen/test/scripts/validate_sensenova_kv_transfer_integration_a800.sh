@@ -8,6 +8,9 @@ cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
 MODEL_PATH="${MODEL_PATH:-/model/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT}"
+DEFAULT_PROMPT="A realistic photo of three red apples arranged to the left "
+DEFAULT_PROMPT+="of a blue bowl."
+PROMPT="${PROMPT:-${DEFAULT_PROMPT}}"
 GPU_ID="${GPU_ID:-0}"
 SERVER_PORT="${SERVER_PORT:-30000}"
 RESULT_ROOT="${OUTPUT_DIR:-/workspace/sensenova-kv-transfer-integration/$(date +%Y%m%d-%H%M%S)}"
@@ -50,10 +53,12 @@ echo "Results: ${RESULT_ROOT}"
 nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
 df -h /dev/shm
 
+TEST_FILE=python/sglang/multimodal_gen/test/unit/test_sensenova_u1.py
 python -m pytest \
-  python/sglang/multimodal_gen/test/unit/test_sensenova_u1.py::test_sensenova_srt_worker_streams_all_kv_layers \
-  python/sglang/multimodal_gen/test/unit/test_sensenova_u1.py::test_sensenova_srt_replay_builds_cache_from_transfer \
-  python/sglang/multimodal_gen/test/unit/test_sensenova_u1.py::test_sensenova_srt_kv_transfer_failure_replays_prefix \
+  "${TEST_FILE}::test_sensenova_srt_worker_streams_all_kv_layers" \
+  "${TEST_FILE}::test_sensenova_srt_thinking_client_reuses_session_for_kv_transfer" \
+  "${TEST_FILE}::test_sensenova_srt_replay_builds_cache_from_transfer" \
+  "${TEST_FILE}::test_sensenova_srt_kv_transfer_failure_replays_prefix" \
   -q | tee "${RESULT_ROOT}/unit-tests.log"
 
 run_mode() {
@@ -81,6 +86,7 @@ run_mode() {
     --output-dir "${mode_dir}/profile" \
     --base-url "http://127.0.0.1:${SERVER_PORT}" \
     --model "${MODEL_PATH}" \
+    --prompt "${PROMPT}" \
     --width "${WIDTH:-1024}" \
     --height "${HEIGHT:-1024}" \
     --steps "${STEPS:-10}" \
@@ -102,6 +108,7 @@ python "${SCRIPT_DIR}/compare_sensenova_kv_transfer_integration.py" \
 {
   echo "commit=$(git rev-parse HEAD)"
   echo "model_path=${MODEL_PATH}"
+  echo "prompt=${PROMPT}"
   echo "resolution=${WIDTH:-1024}x${HEIGHT:-1024}"
   echo "steps=${STEPS:-10}"
   echo "budget=${BUDGET:-64}"
