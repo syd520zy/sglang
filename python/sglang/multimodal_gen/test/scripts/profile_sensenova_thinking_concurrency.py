@@ -7,6 +7,8 @@ instead of `concurrency`.
 """
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import statistics
@@ -148,6 +150,18 @@ def request_one(args, *, case, think_mode, max_think_tokens, seed, request_index
     if len(result.get("data", [])) != 1:
         record["error"] = "server did not return exactly one image"
         return record
+    encoded_image = result["data"][0].get("b64_json")
+    try:
+        image = base64.b64decode(encoded_image, validate=True)
+    except (binascii.Error, TypeError, ValueError):
+        record["error"] = "server returned an invalid b64_json image"
+        return record
+    image_dir = args.output_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    image_path = (
+        image_dir / f"{case}-wave-{wave}-request-{request_index}-seed-{seed}.png"
+    )
+    image_path.write_bytes(image)
     usage = result.get("usage") or {}
     error = validate_usage(
         usage,
@@ -164,6 +178,8 @@ def request_one(args, *, case, think_mode, max_think_tokens, seed, request_index
         {
             "reasoning_tokens": usage.get("reasoning_tokens", 0),
             "thinking_backend": usage.get("thinking_backend") if think_mode else None,
+            "image_path": str(image_path),
+            "image_sha256": hashlib.sha256(image).hexdigest(),
             "think_text_sha256": (
                 hashlib.sha256(usage["think_text"].encode("utf-8")).hexdigest()
                 if think_mode
