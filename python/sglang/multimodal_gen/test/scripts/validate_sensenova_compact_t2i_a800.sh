@@ -94,6 +94,13 @@ stop_processes
 SERVER_PID=""
 SAMPLER_PID=""
 
+python "${SCRIPT_DIR}/inspect_sensenova_srt_runtime.py" \
+  --runtime-dir "${RESULT_ROOT}/thinking-runtime" \
+  --context-length 4096 \
+  --max-concurrency 2 \
+  --cuda-graph-max-bs 2 \
+  --output "${RESULT_ROOT}/srt-runtime-summary.json" \
+  | tee "${RESULT_ROOT}/srt-runtime-summary.log"
 grep -n "compact T2I removed" "${RESULT_ROOT}/server.log" \
   | tee "${RESULT_ROOT}/compact-weight-release.log"
 python -m json.tool "${RESULT_ROOT}/gpu-memory-summary.json"

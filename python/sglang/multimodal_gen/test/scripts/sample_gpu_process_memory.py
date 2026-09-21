@@ -62,8 +62,10 @@ def write_summary(path: Path, samples: list[dict], error: str | None) -> None:
     for sample in samples:
         pid = sample["pid"]
         peaks[pid] = max(peaks[pid], sample["used_memory_mb"])
-        commands[pid] = sample["command"]
-        ppids[pid] = sample["ppid"]
+        if sample["command"] or pid not in commands:
+            commands[pid] = sample["command"]
+        if sample["ppid"] is not None or pid not in ppids:
+            ppids[pid] = sample["ppid"]
         totals[sample["sample"]] += sample["used_memory_mb"]
     report = {
         "sample_count": len(totals),
