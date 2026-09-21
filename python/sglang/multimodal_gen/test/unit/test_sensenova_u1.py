@@ -1413,6 +1413,47 @@ def test_sensenova_u1_generation_stage_returns_thinking_usage():
     assert usage.thinking_backend == "srt"
 
 
+def test_sensenova_u1_generation_stage_reports_all_transferred_prefixes():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=1024,
+        height=1024,
+        think_mode=False,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=1,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+    model.last_srt_kv_transferred_prefixes = ["condition", "uncondition"]
+    model.last_srt_kv_transfer_timings = {
+        "session_reused_tokens": 0,
+        "srt_cached_tokens": 0,
+    }
+
+    output = SenseNovaU1GenerationStage(
+        model=model, tokenizer="tok", thinking_backend=object()
+    ).forward(batch, server_args=SimpleNamespace())
+
+    assert output.usage == {
+        "srt_kv_transfer_used": True,
+        "srt_kv_transferred_prefixes": ["condition", "uncondition"],
+        "srt_kv_session_reused_tokens": 0,
+        "srt_kv_cached_tokens": 0,
+    }
+    assert ImageUsage.model_validate(output.usage).srt_kv_transferred_prefixes == [
+        "condition",
+        "uncondition",
+    ]
+
+
 @pytest.mark.parametrize(
     ("first_token", "next_tokens", "max_think_tokens", "expected_suffix"),
     [
@@ -1881,6 +1922,7 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
         device=torch.device("cpu"),
         language_model=SimpleNamespace(config=config),
         _t2i_prefix_forward=prefix_forward,
+        last_srt_kv_transferred_prefixes=[],
     )
 
     class Tokenizer:
@@ -1906,6 +1948,95 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
     torch.testing.assert_close(cache.layers[0].keys, exported[:, 0])
     torch.testing.assert_close(cache.layers[0].values, exported[:, 1])
     assert not (tmp_path / "buffer.lock").exists()
+
+
+def test_sensenova_srt_imports_finalized_text_prefix_without_session(monkeypatch):
+    captured = {}
+    expected_cache = object()
+    expected_timings = {"import_wall": 1.0}
+
+    class Backend:
+        def transfer_prefix_kv(self, token_ids, dump_id, session_context):
+            captured.update(
+                token_ids=token_ids,
+                dump_id=dump_id,
+                session_context=session_context,
+            )
+            return {"dump_id": dump_id}
+
+    def load_prefix(metadata, token_ids, config, device):
+        captured.update(
+            metadata=metadata,
+            load_token_ids=token_ids,
+            config=config,
+            device=device,
+        )
+        return expected_cache, expected_timings
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."
+        "modeling_neo_chat._load_srt_prefix_kv",
+        load_prefix,
+    )
+    config = object()
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(config=config),
+        device=torch.device("cpu"),
+    )
+
+    cache, timings = NEOChatModel._import_srt_prefix_tokens(model, Backend(), [1, 2, 3])
+
+    assert cache is expected_cache
+    assert timings is expected_timings
+    assert captured["token_ids"] == [1, 2, 3]
+    assert captured["load_token_ids"] == [1, 2, 3]
+    assert captured["session_context"] is None
+    assert captured["metadata"] == {"dump_id": captured["dump_id"]}
+    assert captured["config"] is config
+    assert captured["device"] == torch.device("cpu")
+
+
+def test_sensenova_srt_text_prefix_transfer_uses_valid_tokens_only():
+    captured = {}
+    expected_cache = object()
+    expected_timings = {"import_wall": 1.0}
+    model = SimpleNamespace()
+
+    def import_prefix(_backend, token_ids):
+        captured["token_ids"] = token_ids
+        return expected_cache, expected_timings
+
+    model._import_srt_prefix_tokens = import_prefix
+    cache, timings = NEOChatModel._try_import_srt_text_prefix(
+        model,
+        object(),
+        torch.tensor([[1, 2, 3, 0]]),
+        torch.tensor(3),
+        "condition",
+    )
+
+    assert cache is expected_cache
+    assert timings is expected_timings
+    assert captured["token_ids"] == [1, 2, 3]
+
+
+def test_sensenova_srt_text_prefix_transfer_failure_allows_native_fallback():
+    model = SimpleNamespace(
+        _import_srt_prefix_tokens=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("transfer failed")
+        )
+    )
+
+    cache, timings = NEOChatModel._try_import_srt_text_prefix(
+        model,
+        object(),
+        torch.tensor([[1, 2, 3]]),
+        torch.tensor(3),
+        "CFG",
+    )
+
+    assert cache is None
+    assert timings == {}
 
 
 def test_sensenova_srt_kv_transfer_failure_replays_prefix(monkeypatch, tmp_path):

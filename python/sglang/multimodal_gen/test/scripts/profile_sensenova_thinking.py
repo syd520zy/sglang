@@ -88,6 +88,7 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
         "reasoning_tokens": reasoning_tokens,
         "thinking_backend": thinking_backend,
         "srt_kv_transfer_used": bool(usage.get("srt_kv_transfer_used")),
+        "srt_kv_transferred_prefixes": usage.get("srt_kv_transferred_prefixes"),
         "srt_kv_session_reused_tokens": usage.get("srt_kv_session_reused_tokens"),
         "srt_kv_cached_tokens": usage.get("srt_kv_cached_tokens"),
         "think_text": usage["think_text"] if think_mode else None,

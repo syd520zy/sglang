@@ -13,8 +13,8 @@ def load_records(directory: Path) -> list[dict]:
     return json.loads((directory / "profile" / "records.json").read_text())
 
 
-def thinking_rows(records: list[dict]) -> dict[tuple[str, int], dict]:
-    return {(row["case"], row["seed"]): row for row in records if row["case"] != "off"}
+def indexed_rows(records: list[dict]) -> dict[tuple[str, int], dict]:
+    return {(row["case"], row["seed"]): row for row in records}
 
 
 def compare_images(left: Path, right: Path) -> dict:
@@ -47,8 +47,8 @@ def main() -> None:
     parser.add_argument("--transfer-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    replay = thinking_rows(load_records(args.replay_dir))
-    transfer = thinking_rows(load_records(args.transfer_dir))
+    replay = indexed_rows(load_records(args.replay_dir))
+    transfer = indexed_rows(load_records(args.transfer_dir))
     if set(replay) != set(transfer):
         raise RuntimeError("replay and transfer runs contain different cases")
 
@@ -56,16 +56,20 @@ def main() -> None:
     for key in sorted(replay):
         replay_row = replay[key]
         transfer_row = transfer[key]
-        if replay_row.get("thinking_backend") != "srt":
+        thinking_case = key[0] != "off"
+        if thinking_case and replay_row.get("thinking_backend") != "srt":
             raise RuntimeError(f"replay run did not use SRT: {replay_row}")
-        if transfer_row.get("thinking_backend") != "srt":
+        if thinking_case and transfer_row.get("thinking_backend") != "srt":
             raise RuntimeError(f"transfer run did not use SRT: {transfer_row}")
-        replay_ms = replay_row["stage_timings_ms"]["think_replay_prefill"]
-        transfer_ms = transfer_row["stage_timings_ms"]["think_replay_prefill"]
+        prefix_stage = "think_replay_prefill" if thinking_case else "condition_prefill"
+        replay_ms = replay_row["stage_timings_ms"][prefix_stage]
+        transfer_ms = transfer_row["stage_timings_ms"][prefix_stage]
         replay_image = args.replay_dir / "profile" / replay_row["image_file"]
         transfer_image = args.transfer_dir / "profile" / transfer_row["image_file"]
         name = f"{key[0]}/seed-{key[1]}"
         comparisons[name] = {
+            "case": key[0],
+            "prefix_stage": prefix_stage,
             "reasoning_tokens_match": replay_row["reasoning_tokens"]
             == transfer_row["reasoning_tokens"],
             "think_text_hash_match": replay_row["think_text_sha256"]
@@ -74,11 +78,14 @@ def main() -> None:
             == transfer_row["image_sha256"],
             "image_metrics": compare_images(replay_image, transfer_image),
             "transfer_used": transfer_row.get("srt_kv_transfer_used") is True,
+            "transferred_prefixes": transfer_row.get("srt_kv_transferred_prefixes"),
             "replay_used_transfer": replay_row.get("srt_kv_transfer_used") is True,
             "session_reused_tokens": transfer_row.get("srt_kv_session_reused_tokens"),
             "srt_cached_tokens": transfer_row.get("srt_kv_cached_tokens"),
             "replay_prefill_ms": replay_ms,
             "transfer_prefill_ms": transfer_ms,
+            "replay_cfg_prefill_ms": replay_row["stage_timings_ms"]["cfg_prefill"],
+            "transfer_cfg_prefill_ms": transfer_row["stage_timings_ms"]["cfg_prefill"],
             "speedup": round(replay_ms / transfer_ms, 3),
         }
 
@@ -86,11 +93,17 @@ def main() -> None:
         row["reasoning_tokens_match"]
         and row["think_text_hash_match"]
         and row["transfer_used"]
+        and set(row["transferred_prefixes"] or ()) == {"condition", "uncondition"}
         and not row["replay_used_transfer"]
-        and isinstance(row["session_reused_tokens"], int)
-        and row["session_reused_tokens"] > 0
-        and isinstance(row["srt_cached_tokens"], int)
-        and row["srt_cached_tokens"] > 0
+        and (
+            row["case"] == "off"
+            or (
+                isinstance(row["session_reused_tokens"], int)
+                and row["session_reused_tokens"] > 0
+                and isinstance(row["srt_cached_tokens"], int)
+                and row["srt_cached_tokens"] > 0
+            )
+        )
         for row in comparisons.values()
     )
     report = {

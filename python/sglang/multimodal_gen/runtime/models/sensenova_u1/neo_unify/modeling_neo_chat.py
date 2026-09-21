@@ -1001,6 +1001,41 @@ class NEOChatModel(PreTrainedModel):
             transfer_context,
         )
 
+    def _import_srt_prefix_tokens(
+        self,
+        thinking_backend,
+        token_ids: list[int],
+        session_context=None,
+    ):
+        transfer_id = _token_ids_sha256(token_ids)[:12] + f"{time.time_ns():x}"
+        metadata = thinking_backend.transfer_prefix_kv(
+            token_ids, transfer_id, session_context
+        )
+        return _load_srt_prefix_kv(
+            metadata,
+            token_ids,
+            self.language_model.config,
+            self.device,
+        )
+
+    def _try_import_srt_text_prefix(
+        self,
+        thinking_backend,
+        input_ids,
+        prefix_length,
+        name,
+    ):
+        token_ids = input_ids[0, : int(prefix_length)].tolist()
+        try:
+            return self._import_srt_prefix_tokens(thinking_backend, token_ids)
+        except Exception as exc:
+            logger.warning(
+                "SenseNova SRT %s KV transfer failed; running the native prefix: %s",
+                name,
+                exc,
+            )
+            return None, {}
+
     def _replay_srt_think_prefix(
         self,
         tokenizer,
@@ -1090,20 +1125,16 @@ class NEOChatModel(PreTrainedModel):
             and transfer_context is not None
         )
         if use_transfer:
-            transfer_id = (
-                _token_ids_sha256(replay_rows[0].tolist())[:12] + f"{time.time_ns():x}"
-            )
             try:
-                metadata = thinking_backend.transfer_prefix_kv(
-                    replay_rows[0].tolist(), transfer_id, transfer_context
-                )
-                cache, self.last_srt_kv_transfer_timings = _load_srt_prefix_kv(
-                    metadata,
-                    replay_rows[0].tolist(),
-                    self.language_model.config,
-                    self.device,
+                cache, self.last_srt_kv_transfer_timings = (
+                    self._import_srt_prefix_tokens(
+                        thinking_backend,
+                        replay_rows[0].tolist(),
+                        transfer_context,
+                    )
                 )
                 self.last_srt_kv_transfer_used = True
+                self.last_srt_kv_transferred_prefixes.append("condition")
             except Exception as exc:
                 self.last_srt_kv_transfer_used = False
                 logger.warning(
@@ -2822,6 +2853,7 @@ class NEOChatModel(PreTrainedModel):
         self.last_thinking_backend = None
         self.last_srt_kv_transfer_used = False
         self.last_srt_kv_transfer_timings = {}
+        self.last_srt_kv_transferred_prefixes = []
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
         prompts = prompt if isinstance(prompt, list) else [prompt]
@@ -2833,6 +2865,14 @@ class NEOChatModel(PreTrainedModel):
             raise ValueError(
                 f"batch_size={batch_size} does not match {len(prompts)} prompts"
             )
+        use_direct_srt_prefix = (
+            os.environ.get(_USE_SRT_KV_TRANSFER) == "1"
+            and not os.environ.get(_KV_DIAGNOSTIC_DIR)
+            and os.environ.get(_KV_TRANSFER_DIR)
+            and len(prompts) == 1
+            and thinking_backend is not None
+            and hasattr(thinking_backend, "transfer_prefix_kv")
+        )
         self._notify_layer_offload_phase("prefix")
         merge_size = int(1 / self.downsample_ratio)
 
@@ -2952,6 +2992,7 @@ class NEOChatModel(PreTrainedModel):
                     self.last_thinking_backends = ["srt"] * len(prompts)
                     used_srt = True
                 except Exception as exc:
+                    use_direct_srt_prefix = False
                     if hasattr(thinking_backend, "close_transfer_context"):
                         thinking_backend.close_transfer_context(transfer_context)
                     first_failure = thinking_backend.fail(exc)
@@ -2995,6 +3036,7 @@ class NEOChatModel(PreTrainedModel):
                 if profile_stages:
                     profiler.timings_ms["think_replay_prefill"] = 0.0
             if used_srt:
+                use_direct_srt_prefix = self.last_srt_kv_transfer_used
                 image_text_len = (
                     int(condition_prefix_lengths[0].item())
                     if len(prompts) == 1
@@ -3011,23 +3053,65 @@ class NEOChatModel(PreTrainedModel):
             if not used_srt:
                 del outputs_condition
         else:
-            past_key_values_condition, prefix_hidden_states = self._t2i_prefix_forward(
-                input_ids_condition, indexes_condition, attention_mask_condition_prefix
-            )
-            device = prefix_hidden_states.device
-            dtype = prefix_hidden_states.dtype
-            del prefix_hidden_states
+            past_key_values_condition = None
+            if use_direct_srt_prefix:
+                (
+                    past_key_values_condition,
+                    self.last_srt_kv_transfer_timings,
+                ) = self._try_import_srt_text_prefix(
+                    thinking_backend,
+                    input_ids_condition,
+                    condition_prefix_lengths[0],
+                    "condition",
+                )
+                self.last_srt_kv_transfer_used = past_key_values_condition is not None
+                if self.last_srt_kv_transfer_used:
+                    self.last_srt_kv_transferred_prefixes.append("condition")
+                else:
+                    use_direct_srt_prefix = False
+            if past_key_values_condition is None:
+                (
+                    past_key_values_condition,
+                    prefix_hidden_states,
+                ) = self._t2i_prefix_forward(
+                    input_ids_condition,
+                    indexes_condition,
+                    attention_mask_condition_prefix,
+                )
+                device = prefix_hidden_states.device
+                dtype = prefix_hidden_states.dtype
+                del prefix_hidden_states
+            else:
+                first_cache_layer = past_key_values_condition.layers[0]
+                device = first_cache_layer.keys.device
+                dtype = first_cache_layer.keys.dtype
             profiler.mark("condition_prefill")
             if profile_stages:
                 profiler.timings_ms["think_decode"] = 0.0
                 profiler.timings_ms["think_replay_prefill"] = 0.0
         past_key_values_uncondition = None
         if input_ids_uncondition is not None:
-            past_key_values_uncondition, _ = self._t2i_prefix_forward(
-                input_ids_uncondition,
-                indexes_uncondition,
-                attention_mask_uncondition_prefix,
-            )
+            if use_direct_srt_prefix:
+                (
+                    past_key_values_uncondition,
+                    uncondition_transfer_timings,
+                ) = self._try_import_srt_text_prefix(
+                    thinking_backend,
+                    input_ids_uncondition,
+                    uncondition_prefix_lengths[0],
+                    "CFG",
+                )
+                if past_key_values_uncondition is not None:
+                    self.last_srt_kv_transferred_prefixes.append("uncondition")
+                    self.last_srt_kv_transfer_timings["uncondition"] = (
+                        uncondition_transfer_timings
+                    )
+            if past_key_values_uncondition is None:
+                past_key_values_uncondition, _ = self._t2i_prefix_forward(
+                    input_ids_uncondition,
+                    indexes_uncondition,
+                    attention_mask_uncondition_prefix,
+                )
         profiler.mark("cfg_prefill")
 
         del input_ids_condition, indexes_condition, attention_mask_condition_prefix
