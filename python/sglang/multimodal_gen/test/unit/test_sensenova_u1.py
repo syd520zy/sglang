@@ -2384,8 +2384,9 @@ def test_sensenova_compact_mode_configures_strict_local_kv_transfer(
 
     assert thinking_strict_enabled()
     assert os.environ["SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER"] == "1"
-    assert os.environ["SGLANG_SENSENOVA_KV_TRANSFER_DIR"] == str(
-        tmp_path / "kv-transfer"
+    expected_root = "/dev/shm" if os.path.isdir("/dev/shm") else str(tmp_path)
+    assert os.path.dirname(os.environ["SGLANG_SENSENOVA_KV_TRANSFER_DIR"]) == (
+        expected_root
     )
 
 

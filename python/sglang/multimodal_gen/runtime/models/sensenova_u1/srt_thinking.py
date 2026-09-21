@@ -7,6 +7,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -29,6 +30,7 @@ _ENV_KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
 _ENV_KV_TRANSFER_DIR = "SGLANG_SENSENOVA_KV_TRANSFER_DIR"
 _ENV_USE_KV_TRANSFER = "SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER"
 _ENV_COMPACT_MODE = "SGLANG_SENSENOVA_COMPACT_MODE"
+_ENV_COMPACT_OWNS_KV_TRANSFER_DIR = "SGLANG_SENSENOVA_COMPACT_OWNS_KV_TRANSFER_DIR"
 _DEFAULT_RUNTIME_DIRNAME = "sglang-sensenova-thinking"
 _STARTUP_DEADLINE_S = 600.0
 _KV_DIAGNOSTIC_RID_PREFIX = "sensenova-kvdiag-"
@@ -81,9 +83,14 @@ def _configure_compact_mode(server_args) -> None:
         or os.path.join(tempfile.gettempdir(), _DEFAULT_RUNTIME_DIRNAME)
     )
     os.environ[_ENV_USE_KV_TRANSFER] = "1"
-    os.environ.setdefault(
-        _ENV_KV_TRANSFER_DIR, os.path.join(runtime_root, "kv-transfer")
-    )
+    if _ENV_KV_TRANSFER_DIR not in os.environ:
+        shared_root = "/dev/shm" if os.path.isdir("/dev/shm") else runtime_root
+        os.environ[_ENV_KV_TRANSFER_DIR] = os.path.join(
+            shared_root, f"{_DEFAULT_RUNTIME_DIRNAME}-{os.getpid()}"
+        )
+        os.environ[_ENV_COMPACT_OWNS_KV_TRANSFER_DIR] = "1"
+    else:
+        os.environ.pop(_ENV_COMPACT_OWNS_KV_TRANSFER_DIR, None)
 
 
 def runtime_files(url: str) -> tuple[str, str]:
@@ -664,6 +671,8 @@ class ManagedSRTThinkingServer:
 
             kill_process_tree(self.process.pid, wait_timeout=60)
         self.process.join(timeout=10)
+        if os.environ.get(_ENV_COMPACT_OWNS_KV_TRANSFER_DIR) == "1":
+            shutil.rmtree(os.environ.get(_ENV_KV_TRANSFER_DIR, ""), ignore_errors=True)
         self.status.mark_stopped()
         logger.info(
             "SenseNova internal SRT thinking backend stopped (pid %s)", self.process.pid
