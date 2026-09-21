@@ -7,7 +7,9 @@ import re
 from pathlib import Path
 
 GRAPH_BEGIN = re.compile(r"Capture target decode CUDA graph begin\..*?bs=(\[[^]]*])")
-KV_TOKENS = re.compile(r"KV cache allocated\..*?#tokens:\s*(\d+)")
+KV_TOKENS = re.compile(
+    r"KV cache (?:is )?allocated\..*?#tokens:\s*(\d+)", re.IGNORECASE
+)
 
 
 def inspect_runtime_log(

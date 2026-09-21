@@ -980,12 +980,19 @@ def test_sensenova_thinking_concurrency_summary_does_not_count_queueing_as_overl
     assert parallel["parallelism_ratio"] == 2.0
 
 
-def test_sensenova_srt_runtime_inspection_checks_graph_and_kv_capacity():
+@pytest.mark.parametrize(
+    "kv_log",
+    [
+        "Post-capture KV sizing: KV cache allocated.",
+        "KV Cache is allocated.",
+    ],
+)
+def test_sensenova_srt_runtime_inspection_checks_graph_and_kv_capacity(kv_log):
     report = inspect_runtime_log(
-        """
+        f"""
 Capture target decode CUDA graph begin. backend=piecewise, num_tokens_per_req=1, bs=[1, 2], avail mem=10.00 GB
 Capture target decode CUDA graph end. elapsed=1.00 s, mem usage=1.00 GB, avail mem=9.00 GB.
-Post-capture KV sizing: KV cache allocated. dtype: torch.bfloat16, #tokens: 12288, KV size: 1.00 GB, avail mem=8.00 GB
+{kv_log} dtype: torch.bfloat16, #tokens: 12288, KV size: 1.00 GB, avail mem=8.00 GB
 """,
         context_length=4096,
         max_concurrency=2,
