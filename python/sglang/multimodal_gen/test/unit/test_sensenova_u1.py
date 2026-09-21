@@ -1436,6 +1436,7 @@ def test_sensenova_u1_generation_stage_reports_all_transferred_prefixes():
     model.last_srt_kv_transfer_timings = {
         "session_reused_tokens": 0,
         "srt_cached_tokens": 0,
+        "import_wall": 1.0,
     }
 
     output = SenseNovaU1GenerationStage(
@@ -1445,6 +1446,7 @@ def test_sensenova_u1_generation_stage_reports_all_transferred_prefixes():
     assert output.usage == {
         "srt_kv_transfer_used": True,
         "srt_kv_transferred_prefixes": ["condition", "uncondition"],
+        "srt_kv_transfer_timings_ms": {"import_wall": 1.0},
         "srt_kv_session_reused_tokens": 0,
         "srt_kv_cached_tokens": 0,
     }
@@ -1995,6 +1997,8 @@ def test_sensenova_srt_imports_finalized_text_prefix_without_session(monkeypatch
 
     assert cache is expected_cache
     assert timings is expected_timings
+    assert timings["request_wall"] >= 0
+    assert timings["total_wall"] >= timings["request_wall"]
     assert captured["token_ids"] == [1, 2, 3]
     assert captured["load_token_ids"] == [1, 2, 3]
     assert captured["session_context"] is None

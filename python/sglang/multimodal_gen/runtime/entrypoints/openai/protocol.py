@@ -30,6 +30,7 @@ class ImageUsage(BaseModel):
     thinking_backend: Optional[str] = None
     srt_kv_transfer_used: Optional[bool] = None
     srt_kv_transferred_prefixes: Optional[List[str]] = None
+    srt_kv_transfer_timings_ms: Optional[Dict[str, Any]] = None
     srt_kv_session_reused_tokens: Optional[int] = None
     srt_kv_cached_tokens: Optional[int] = None
     stage_timings_ms: Optional[Dict[str, float]] = None

@@ -79,6 +79,7 @@ def main() -> None:
             "image_metrics": compare_images(replay_image, transfer_image),
             "transfer_used": transfer_row.get("srt_kv_transfer_used") is True,
             "transferred_prefixes": transfer_row.get("srt_kv_transferred_prefixes"),
+            "transfer_breakdown_ms": transfer_row.get("srt_kv_transfer_timings_ms"),
             "replay_used_transfer": replay_row.get("srt_kv_transfer_used") is True,
             "session_reused_tokens": transfer_row.get("srt_kv_session_reused_tokens"),
             "srt_cached_tokens": transfer_row.get("srt_kv_cached_tokens"),

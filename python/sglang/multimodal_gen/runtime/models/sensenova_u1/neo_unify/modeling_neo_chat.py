@@ -1007,16 +1007,21 @@ class NEOChatModel(PreTrainedModel):
         token_ids: list[int],
         session_context=None,
     ):
+        started_at = time.perf_counter()
         transfer_id = _token_ids_sha256(token_ids)[:12] + f"{time.time_ns():x}"
         metadata = thinking_backend.transfer_prefix_kv(
             token_ids, transfer_id, session_context
         )
-        return _load_srt_prefix_kv(
+        request_wall_ms = (time.perf_counter() - started_at) * 1000
+        cache, timings = _load_srt_prefix_kv(
             metadata,
             token_ids,
             self.language_model.config,
             self.device,
         )
+        timings["request_wall"] = request_wall_ms
+        timings["total_wall"] = (time.perf_counter() - started_at) * 1000
+        return cache, timings
 
     def _try_import_srt_text_prefix(
         self,

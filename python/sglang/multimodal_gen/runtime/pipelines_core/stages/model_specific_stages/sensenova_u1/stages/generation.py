@@ -207,6 +207,13 @@ class SenseNovaU1GenerationStage(PipelineStage):
                     "session_reused_tokens"
                 )
                 usage["srt_kv_cached_tokens"] = transfer.get("srt_cached_tokens")
+                timing_details = {
+                    key: value
+                    for key, value in transfer.items()
+                    if key not in {"session_reused_tokens", "srt_cached_tokens"}
+                }
+                if timing_details:
+                    usage["srt_kv_transfer_timings_ms"] = timing_details
             if options.profile_stages:
                 usage["stage_timings_ms"] = (
                     per_request_timings[index]
