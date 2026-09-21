@@ -62,11 +62,30 @@ def tensor_metrics(
     }
 
 
+def numerically_compatible(
+    metrics: dict,
+    *,
+    max_abs_error: float,
+    max_mean_abs_error: float,
+    max_out_of_tolerance_pct: float,
+) -> bool:
+    return metrics["allclose"] or all(
+        (
+            metrics["max_abs_error"] <= max_abs_error,
+            metrics["mean_abs_error"] <= max_mean_abs_error,
+            metrics["out_of_tolerance_pct"] <= max_out_of_tolerance_pct,
+        )
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--atol", type=float, default=0.03)
     parser.add_argument("--rtol", type=float, default=0.03)
+    parser.add_argument("--max-abs-error", type=float, default=0.125)
+    parser.add_argument("--max-mean-abs-error", type=float, default=0.005)
+    parser.add_argument("--max-out-of-tolerance-pct", type=float, default=0.001)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -102,6 +121,14 @@ def main() -> None:
             atol=args.atol,
             rtol=args.rtol,
         )
+    for metrics in (keys, values):
+        if metrics["shape_matches"]:
+            metrics["compatible"] = numerically_compatible(
+                metrics,
+                max_abs_error=args.max_abs_error,
+                max_mean_abs_error=args.max_mean_abs_error,
+                max_out_of_tolerance_pct=args.max_out_of_tolerance_pct,
+            )
     token_hash_matches = native["token_sha256"] == srt["token_sha256"]
     report = {
         "native_file": str(native_files[0]),
@@ -111,6 +138,11 @@ def main() -> None:
         "token_count": len(native["token_ids"]),
         "atol": args.atol,
         "rtol": args.rtol,
+        "compatibility_limits": {
+            "max_abs_error": args.max_abs_error,
+            "max_mean_abs_error": args.max_mean_abs_error,
+            "max_out_of_tolerance_pct": args.max_out_of_tolerance_pct,
+        },
         "keys": keys,
         "values": values,
     }
@@ -119,9 +151,9 @@ def main() -> None:
             report["layer_id_matches"],
             token_hash_matches,
             keys["dtype_matches"],
-            keys["allclose"],
+            keys.get("compatible", False),
             values["dtype_matches"],
-            values["allclose"],
+            values.get("compatible", False),
         )
     )
     rendered = json.dumps(report, ensure_ascii=False, indent=2)

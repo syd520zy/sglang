@@ -95,6 +95,7 @@ from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
 from sglang.multimodal_gen.test.scripts.compare_sensenova_kv_diagnostic import (
     error_metrics,
+    numerically_compatible,
 )
 from sglang.multimodal_gen.test.scripts.inspect_sensenova_srt_runtime import (
     inspect_runtime_log,
@@ -1638,6 +1639,18 @@ def test_sensenova_kv_error_metrics_report_outliers():
     assert metrics["out_of_tolerance_count"] == 1
     assert metrics["out_of_tolerance_pct"] == 50.0
     assert metrics["allclose"] is False
+    assert numerically_compatible(
+        metrics,
+        max_abs_error=0.05,
+        max_mean_abs_error=0.03,
+        max_out_of_tolerance_pct=50.0,
+    )
+    assert not numerically_compatible(
+        metrics,
+        max_abs_error=0.03,
+        max_mean_abs_error=0.03,
+        max_out_of_tolerance_pct=50.0,
+    )
 
 
 def test_sensenova_srt_replay_pads_after_each_complete_prefix():
