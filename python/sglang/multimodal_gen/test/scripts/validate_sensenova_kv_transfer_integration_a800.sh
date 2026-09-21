@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare existing native replay with batch-1 T2I condition KV transfer.
+# Compare native T2I prefix prefill with SRT condition/uncondition KV transfer.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +23,7 @@ export SGLANG_SENSENOVA_THINKING_STRICT=1
 export SGLANG_SENSENOVA_THINKING_MEM_FRACTION="${SGLANG_SENSENOVA_THINKING_MEM_FRACTION:-0.45}"
 export SGLANG_SENSENOVA_KV_TRANSFER_REUSE_BUFFER=1
 export SGLANG_SENSENOVA_KV_TRANSFER_MAX_TOKENS=4096
+BUDGETS="${BUDGETS:-${BUDGET:-64}}"
 
 SERVER_PID=""
 stop_server() {
@@ -58,7 +59,11 @@ python -m pytest \
   "${TEST_FILE}::test_sensenova_srt_worker_streams_all_kv_layers" \
   "${TEST_FILE}::test_sensenova_srt_thinking_client_reuses_session_for_kv_transfer" \
   "${TEST_FILE}::test_sensenova_srt_replay_builds_cache_from_transfer" \
+  "${TEST_FILE}::test_sensenova_srt_imports_finalized_text_prefix_without_session" \
+  "${TEST_FILE}::test_sensenova_srt_text_prefix_transfer_uses_valid_tokens_only" \
+  "${TEST_FILE}::test_sensenova_srt_text_prefix_transfer_failure_allows_native_fallback" \
   "${TEST_FILE}::test_sensenova_srt_kv_transfer_failure_replays_prefix" \
+  "${TEST_FILE}::test_sensenova_u1_generation_stage_reports_all_transferred_prefixes" \
   -q | tee "${RESULT_ROOT}/unit-tests.log"
 
 run_mode() {
@@ -82,6 +87,7 @@ run_mode() {
     sleep 5
   done
 
+  read -r -a budget_args <<<"${BUDGETS//,/ }"
   python "${SCRIPT_DIR}/profile_sensenova_thinking.py" \
     --output-dir "${mode_dir}/profile" \
     --base-url "http://127.0.0.1:${SERVER_PORT}" \
@@ -90,7 +96,7 @@ run_mode() {
     --width "${WIDTH:-1024}" \
     --height "${HEIGHT:-1024}" \
     --steps "${STEPS:-10}" \
-    --budgets "${BUDGET:-64}" \
+    --budgets "${budget_args[@]}" \
     --repeats "${REPEATS:-2}" \
     | tee "${mode_dir}/profile.log"
   stop_server
@@ -111,7 +117,7 @@ python "${SCRIPT_DIR}/compare_sensenova_kv_transfer_integration.py" \
   echo "prompt=${PROMPT}"
   echo "resolution=${WIDTH:-1024}x${HEIGHT:-1024}"
   echo "steps=${STEPS:-10}"
-  echo "budget=${BUDGET:-64}"
+  echo "budgets=${BUDGETS}"
   echo "repeats=${REPEATS:-2}"
   python -c 'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")'
   nvidia-smi
