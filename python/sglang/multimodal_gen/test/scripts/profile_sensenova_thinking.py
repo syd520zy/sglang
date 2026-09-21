@@ -1,6 +1,7 @@
 """Profile SenseNova text-to-image stages with and without thinking."""
 
 import argparse
+import base64
 import hashlib
 import json
 import statistics
@@ -74,8 +75,15 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
     if not think_mode and reasoning_tokens:
         raise ValueError("Thinking tokens were returned while thinking was disabled")
 
+    case = f"think_{max_think_tokens}" if think_mode else "off"
+    image_bytes = base64.b64decode(result["data"][0]["b64_json"], validate=True)
+    image_file = Path("images") / f"{case}-seed-{seed}.png"
+    image_path = args.output_dir / image_file
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_bytes(image_bytes)
+
     return {
-        "case": f"think_{max_think_tokens}" if think_mode else "off",
+        "case": case,
         "seed": seed,
         "reasoning_tokens": reasoning_tokens,
         "thinking_backend": thinking_backend,
@@ -88,9 +96,8 @@ def request_one(args, *, think_mode, max_think_tokens, seed, profile_stages=True
         ),
         "client_elapsed_ms": round(client_elapsed_ms, 3),
         "outside_model_ms": round(client_elapsed_ms - timings["total"], 3),
-        "image_sha256": hashlib.sha256(
-            result["data"][0]["b64_json"].encode("ascii")
-        ).hexdigest(),
+        "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "image_file": image_file.as_posix(),
         "stage_timings_ms": timings,
     }
 
