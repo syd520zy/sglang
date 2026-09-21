@@ -229,7 +229,8 @@ class NEOChatModel(Qwen3ForCausalLM):
         dump_id = req.rid.removeprefix(_KV_DIAGNOSTIC_RID_PREFIX)
         if not dump_id or not dump_id.isascii() or not dump_id.isalnum():
             raise ValueError(f"invalid SenseNova KV diagnostic id: {dump_id!r}")
-        if not req.kv.holds_kv or req.kv.kv_committed_len <= 0:
+        length = len(req.origin_input_ids)
+        if not req.kv.holds_kv or length <= 0 or req.kv.kv_committed_len < length:
             raise RuntimeError("SenseNova KV diagnostic request has no committed KV")
 
         kv_pool = token_to_kv_pool_allocator.get_kvcache()
@@ -238,12 +239,10 @@ class NEOChatModel(Qwen3ForCausalLM):
         if getattr(kv_pool, "is_quantized_kv_cache", False):
             raise RuntimeError("SenseNova KV diagnostic requires an unquantized cache")
 
-        length = req.kv.kv_committed_len
         slots = req_to_token_pool.req_to_token[req.kv.req_pool_idx, :length]
         layer_id = kv_pool.start_layer
         keys, values = kv_pool.get_kv_buffer(layer_id)
-        token_ids = list(req.origin_input_ids) + list(req.output_ids)
-        token_ids = [int(token_id) for token_id in token_ids[:length]]
+        token_ids = [int(token_id) for token_id in req.origin_input_ids]
         token_sha256 = hashlib.sha256(
             ",".join(map(str, token_ids)).encode()
         ).hexdigest()

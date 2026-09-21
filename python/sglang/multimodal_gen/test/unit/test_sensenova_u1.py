@@ -1607,7 +1607,7 @@ def test_sensenova_srt_worker_dumps_committed_nhd_kv(monkeypatch, tmp_path):
         rid="sensenova-kvdiag-abc123",
         origin_input_ids=[11, 12],
         output_ids=[13],
-        kv=SimpleNamespace(holds_kv=True, kv_committed_len=2, req_pool_idx=0),
+        kv=SimpleNamespace(holds_kv=True, kv_committed_len=3, req_pool_idx=0),
     )
     req_to_token_pool = SimpleNamespace(
         req_to_token=torch.tensor([[3, 5, 0]], dtype=torch.long)
