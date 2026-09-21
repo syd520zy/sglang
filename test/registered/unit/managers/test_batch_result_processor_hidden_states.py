@@ -240,6 +240,54 @@ class TestPrefillSkippedOutput(CustomTestCase):
         )
 
 
+class TestPrefillKVRelease(CustomTestCase):
+    def test_finished_request_runs_model_hook_before_releasing_kv(self):
+        processor = _make_processor(self)
+        req = _PrefillReq(
+            rid="prefill-finish",
+            inflight_middle_chunks=0,
+            return_hidden_states=False,
+        )
+        req.return_routed_experts = False
+        req.finished = lambda: bool(req.output_ids)
+        batch = SimpleNamespace(
+            reqs=[req],
+            decoding_reqs=[],
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(
+                hidden_states=None,
+                customized_info=None,
+                sampling_mask_output=None,
+            ),
+            next_token_ids=torch.tensor([1]),
+            extend_input_len_per_req=[1],
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components."
+            "batch_result_processor.release_kv_cache"
+        ) as release:
+            processor.process_batch_result_prefill(batch, result)
+
+        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(req)
+        release.assert_called_once_with(req, processor.tree_cache, is_insert=True)
+
+
 class TestDecodeWithoutLogits(CustomTestCase):
     def test_pipeline_result_commits_token_without_sampling_metadata(self):
         processor = _make_processor(self)
