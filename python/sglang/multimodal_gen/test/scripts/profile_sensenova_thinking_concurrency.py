@@ -180,6 +180,11 @@ def request_one(args, *, case, think_mode, max_think_tokens, seed, request_index
             "thinking_backend": usage.get("thinking_backend") if think_mode else None,
             "image_path": str(image_path),
             "image_sha256": hashlib.sha256(image).hexdigest(),
+            "srt_kv_transfer_used": usage.get("srt_kv_transfer_used", False),
+            "srt_kv_transferred_prefixes": usage.get("srt_kv_transferred_prefixes", []),
+            "srt_kv_session_reused_tokens": usage.get("srt_kv_session_reused_tokens"),
+            "srt_kv_cached_tokens": usage.get("srt_kv_cached_tokens"),
+            "srt_kv_transfer_timings_ms": usage.get("srt_kv_transfer_timings_ms"),
             "think_text_sha256": (
                 hashlib.sha256(usage["think_text"].encode("utf-8")).hexdigest()
                 if think_mode
