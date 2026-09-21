@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1633,6 +1634,8 @@ def test_sensenova_srt_worker_dumps_committed_nhd_kv(monkeypatch, tmp_path):
 
 def test_sensenova_srt_worker_streams_all_kv_layers(monkeypatch, tmp_path):
     monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_REUSE_BUFFER", "1")
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_MAX_TOKENS", "8")
     keys = [
         torch.arange(60, dtype=torch.bfloat16).reshape(10, 2, 3) + layer * 100
         for layer in range(2)
@@ -1663,6 +1666,10 @@ def test_sensenova_srt_worker_streams_all_kv_layers(monkeypatch, tmp_path):
 
     metadata = json.loads((tmp_path / "abc123.json").read_text())
     assert metadata["shape"] == [2, 2, 2, 2, 3]
+    assert metadata["data_file"] == "buffer.bin"
+    assert metadata["reuse_buffer"] is True
+    assert (tmp_path / "buffer.lock").read_text() == "abc123"
+    assert (tmp_path / "buffer.bin").stat().st_size == 384
     exported = torch.from_file(
         str(tmp_path / metadata["data_file"]),
         shared=False,
@@ -1747,6 +1754,124 @@ def test_sensenova_srt_replay_pads_after_each_complete_prefix():
         [True, True, True, True, True, True, False],
     ]
     assert lengths.tolist() == [7, 6]
+
+
+def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER", "1")
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", str(tmp_path))
+    config = NEOLLMConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+    )
+    exported = torch.arange(96, dtype=torch.bfloat16).reshape(1, 2, 2, 6, 4)
+
+    class Backend:
+        def transfer_prefix_kv(self, token_ids, dump_id):
+            data_path = tmp_path / "buffer.bin"
+            with open(data_path, "wb") as handle:
+                handle.truncate(exported.numel() * exported.element_size())
+            mapped = torch.from_file(
+                str(data_path),
+                shared=True,
+                size=exported.numel(),
+                dtype=exported.dtype,
+            ).view(exported.shape)
+            mapped.copy_(exported)
+            del mapped
+            (tmp_path / "buffer.lock").write_text(dump_id)
+            metadata = {
+                "dump_id": dump_id,
+                "token_sha256": hashlib.sha256(
+                    ",".join(map(str, token_ids)).encode()
+                ).hexdigest(),
+                "layer_ids": [0],
+                "shape": list(exported.shape),
+                "dtype": "torch.bfloat16",
+                "data_file": "buffer.bin",
+                "data_bytes": exported.numel() * exported.element_size(),
+                "reuse_buffer": True,
+                "lock_file": "buffer.lock",
+                "timings_ms": {"wall": 1.0},
+            }
+            (tmp_path / f"{dump_id}.json").write_text(json.dumps(metadata))
+            return metadata
+
+    def prefix_forward(*_args):
+        raise AssertionError("native replay must be skipped")
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        language_model=SimpleNamespace(config=config),
+        _t2i_prefix_forward=prefix_forward,
+    )
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.tensor([[20, 21]])}
+
+    cache, hidden, *_ = NEOChatModel._replay_srt_think_prefix(
+        model,
+        Tokenizer(),
+        torch.tensor([[1, 2]]),
+        torch.tensor([2]),
+        [[7, 9]],
+        "<img>",
+        Backend(),
+    )
+
+    assert hidden is None
+    assert model.last_srt_kv_transfer_used is True
+    torch.testing.assert_close(cache.layers[0].keys, exported[:, 0])
+    torch.testing.assert_close(cache.layers[0].values, exported[:, 1])
+    assert not (tmp_path / "buffer.lock").exists()
+
+
+def test_sensenova_srt_kv_transfer_failure_replays_prefix(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER", "1")
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", str(tmp_path))
+    expected_cache = object()
+
+    class Backend:
+        def transfer_prefix_kv(self, _token_ids, _dump_id):
+            raise RuntimeError("transfer failed")
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        language_model=SimpleNamespace(config=NEOLLMConfig()),
+        _t2i_prefix_forward=lambda *_args: (
+            expected_cache,
+            torch.zeros((1, 6, 4)),
+        ),
+    )
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.tensor([[20, 21]])}
+
+    cache, hidden, *_ = NEOChatModel._replay_srt_think_prefix(
+        model,
+        Tokenizer(),
+        torch.tensor([[1, 2]]),
+        torch.tensor([2]),
+        [[7, 9]],
+        "<img>",
+        Backend(),
+    )
+
+    assert cache is expected_cache
+    assert hidden.shape == (1, 6, 4)
+    assert model.last_srt_kv_transfer_used is False
 
 
 def test_sensenova_srt_replay_dumps_matching_native_prefix(monkeypatch, tmp_path):

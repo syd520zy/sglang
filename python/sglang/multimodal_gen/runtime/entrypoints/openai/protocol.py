@@ -28,6 +28,7 @@ class ImageUsage(BaseModel):
     reasoning_tokens: Optional[int] = 0
     think_text: Optional[str] = None
     thinking_backend: Optional[str] = None
+    srt_kv_transfer_used: Optional[bool] = None
     stage_timings_ms: Optional[Dict[str, float]] = None
     image_count: Optional[int] = None
 

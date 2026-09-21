@@ -26,9 +26,11 @@ _ENV_STRICT = "SGLANG_SENSENOVA_THINKING_STRICT"
 _ENV_RUNTIME_DIR = "SGLANG_SENSENOVA_THINKING_RUNTIME_DIR"
 _ENV_LOG_FILE = "SGLANG_SENSENOVA_THINKING_LOG_FILE"
 _ENV_KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
+_ENV_KV_TRANSFER_DIR = "SGLANG_SENSENOVA_KV_TRANSFER_DIR"
 _DEFAULT_RUNTIME_DIRNAME = "sglang-sensenova-thinking"
 _STARTUP_DEADLINE_S = 600.0
 _KV_DIAGNOSTIC_RID_PREFIX = "sensenova-kvdiag-"
+_KV_TRANSFER_RID_PREFIX = "sensenova-kvxfer-"
 
 
 class ThinkingBackendState(str, Enum):
@@ -327,6 +329,47 @@ class SRTThinkingClient:
         except requests.RequestException as exc:
             self.fail(exc)
             raise
+
+    def transfer_prefix_kv(self, input_ids: list[int], dump_id: str) -> dict:
+        """Ask SRT to export a finalized prefix and return its transfer metadata."""
+        output_dir = os.environ.get(_ENV_KV_TRANSFER_DIR)
+        if not output_dir:
+            raise RuntimeError(f"{_ENV_KV_TRANSFER_DIR} is not configured")
+        response = requests.post(
+            f"{self.url}/generate",
+            json={
+                "rid": f"{_KV_TRANSFER_RID_PREFIX}{dump_id}",
+                "input_ids": input_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 1,
+                    "skip_special_tokens": False,
+                },
+            },
+            timeout=(self.connect_timeout, self.timeout),
+        )
+        response.raise_for_status()
+        metadata_path = os.path.join(output_dir, f"{dump_id}.json")
+        try:
+            with open(metadata_path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, ValueError) as exc:
+            lock_path = os.path.join(output_dir, "buffer.lock")
+            try:
+                with open(lock_path, encoding="utf-8") as handle:
+                    owns_lock = handle.read() == dump_id
+                if owns_lock:
+                    os.remove(lock_path)
+            except OSError:
+                pass
+            try:
+                os.remove(os.path.join(output_dir, f"{dump_id}.bin"))
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"SenseNova SRT response completed without valid KV metadata: "
+                f"{metadata_path}"
+            ) from exc
 
     def fail(self, exc: BaseException) -> bool:
         """Mark SRT unusable; True when this was its first failure on this client."""

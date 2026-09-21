@@ -13,7 +13,7 @@ import transformers
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import GenerationConfig
-from transformers.cache_utils import DynamicLayer
+from transformers.cache_utils import DynamicCache, DynamicLayer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
@@ -41,6 +41,8 @@ from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 logger = logging.get_logger(__name__)
 
 _KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
+_KV_TRANSFER_DIR = "SGLANG_SENSENOVA_KV_TRANSFER_DIR"
+_USE_SRT_KV_TRANSFER = "SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER"
 
 
 def _token_ids_sha256(token_ids: list[int]) -> str:
@@ -63,6 +65,88 @@ def _dump_native_prefix_kv(cache, token_ids: list[int], dump_id: str) -> None:
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path / f"{dump_id}-native.pt")
+
+
+def _load_srt_prefix_kv(
+    metadata: dict,
+    token_ids: list[int],
+    config,
+    device: torch.device,
+):
+    output_dir = Path(os.environ[_KV_TRANSFER_DIR])
+    metadata_path = output_dir / f"{metadata.get('dump_id')}.json"
+    data_path = output_dir / Path(str(metadata.get("data_file"))).name
+    lock_file = metadata.get("lock_file")
+    cleanup = [metadata_path]
+    if metadata.get("reuse_buffer"):
+        if lock_file:
+            cleanup.append(output_dir / Path(str(lock_file)).name)
+    else:
+        cleanup.append(data_path)
+    try:
+        expected_shape = (
+            int(config.num_hidden_layers),
+            2,
+            int(config.num_key_value_heads),
+            len(token_ids),
+            int(config.head_dim),
+        )
+        shape = tuple(metadata.get("shape") or ())
+        if shape != expected_shape:
+            raise RuntimeError(
+                f"SenseNova SRT KV shape {shape} does not match {expected_shape}"
+            )
+        if metadata.get("layer_ids") != list(range(expected_shape[0])):
+            raise RuntimeError("SenseNova SRT KV layer order does not match")
+        if metadata.get("dtype") != "torch.bfloat16":
+            raise RuntimeError(
+                f"SenseNova SRT KV dtype is {metadata.get('dtype')}, expected BF16"
+            )
+        if metadata.get("token_sha256") != _token_ids_sha256(token_ids):
+            raise RuntimeError("SenseNova SRT KV token hash does not match")
+        expected_bytes = (
+            math.prod(shape) * torch.empty((), dtype=torch.bfloat16).element_size()
+        )
+        if metadata.get("data_bytes") != expected_bytes:
+            raise RuntimeError("SenseNova SRT KV metadata has an invalid byte count")
+        if data_path.stat().st_size < expected_bytes:
+            raise RuntimeError("SenseNova SRT KV shared buffer is incomplete")
+
+        mapped = torch.from_file(
+            str(data_path),
+            shared=False,
+            size=math.prod(shape),
+            dtype=torch.bfloat16,
+        ).view(shape)
+        pin_memory = device.type == "cuda"
+        pinned = torch.empty(
+            (2, *shape[2:]), dtype=torch.bfloat16, pin_memory=pin_memory
+        )
+        cache = DynamicCache(config=config)
+        shared_to_pinned_ms = 0.0
+        h2d_ms = 0.0
+        wall_started = time.perf_counter()
+        for layer in range(shape[0]):
+            stage_started = time.perf_counter()
+            pinned.copy_(mapped[layer])
+            shared_to_pinned_ms += (time.perf_counter() - stage_started) * 1000
+            stage_started = time.perf_counter()
+            keys = pinned[0].unsqueeze(0).to(device, non_blocking=pin_memory)
+            values = pinned[1].unsqueeze(0).to(device, non_blocking=pin_memory)
+            if pin_memory:
+                torch.cuda.synchronize(device)
+            h2d_ms += (time.perf_counter() - stage_started) * 1000
+            cache.update(keys, values, layer)
+        timings = {
+            "shared_to_pinned": shared_to_pinned_ms,
+            "h2d": h2d_ms,
+            "import_wall": (time.perf_counter() - wall_started) * 1000,
+            "export": metadata.get("timings_ms") or {},
+        }
+        return cache, timings
+    finally:
+        for path in cleanup:
+            path.unlink(missing_ok=True)
 
 
 class _SenseNovaPreallocatedLayer(DynamicLayer):
@@ -963,9 +1047,38 @@ class NEOChatModel(PreTrainedModel):
         attention_mask = {
             "full_attention": create_block_causal_mask(t_idx, key_valid_mask)
         }
-        cache, hidden_states = self._t2i_prefix_forward(
-            replay_ids, indexes, attention_mask
+        cache = hidden_states = None
+        use_transfer = (
+            os.environ.get(_USE_SRT_KV_TRANSFER) == "1"
+            and diagnostic_dir is None
+            and len(replay_rows) == 1
+            and thinking_backend is not None
+            and hasattr(thinking_backend, "transfer_prefix_kv")
         )
+        if use_transfer:
+            transfer_id = (
+                _token_ids_sha256(replay_rows[0].tolist())[:12] + f"{time.time_ns():x}"
+            )
+            try:
+                metadata = thinking_backend.transfer_prefix_kv(
+                    replay_rows[0].tolist(), transfer_id
+                )
+                cache, self.last_srt_kv_transfer_timings = _load_srt_prefix_kv(
+                    metadata,
+                    replay_rows[0].tolist(),
+                    self.language_model.config,
+                    self.device,
+                )
+                self.last_srt_kv_transfer_used = True
+            except Exception as exc:
+                self.last_srt_kv_transfer_used = False
+                logger.warning(
+                    "SenseNova SRT KV transfer failed; replaying the prefix: %s", exc
+                )
+        if cache is None:
+            cache, hidden_states = self._t2i_prefix_forward(
+                replay_ids, indexes, attention_mask
+            )
         if diagnostic_id is not None:
             _dump_native_prefix_kv(cache, diagnostic_token_ids, diagnostic_id)
         return cache, hidden_states, indexes, key_valid_mask, replay_lengths
@@ -2673,6 +2786,8 @@ class NEOChatModel(PreTrainedModel):
         profiler = _SenseNovaStageTimer(profile_stages, self.device)
         self.last_profile_timings_ms = {}
         self.last_thinking_backend = None
+        self.last_srt_kv_transfer_used = False
+        self.last_srt_kv_transfer_timings = {}
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
         prompts = prompt if isinstance(prompt, list) else [prompt]
@@ -2787,8 +2902,9 @@ class NEOChatModel(PreTrainedModel):
                         IMG_START_TOKEN,
                         thinking_backend,
                     )
-                    device = prefix_hidden_states.device
-                    dtype = prefix_hidden_states.dtype
+                    first_cache_layer = past_key_values_condition.layers[0]
+                    device = first_cache_layer.keys.device
+                    dtype = first_cache_layer.keys.dtype
                     think_text = think_texts[0] if len(prompts) == 1 else think_texts
                     del prefix_hidden_states, think_token_ids
                     profiler.mark("think_replay_prefill")

@@ -196,6 +196,8 @@ class SenseNovaU1GenerationStage(PipelineStage):
                     reasoning_tokens=int(think_token_counts[index]),
                     thinking_backend=thinking_backends[index],
                 )
+                if getattr(self.model, "last_srt_kv_transfer_used", False):
+                    usage["srt_kv_transfer_used"] = True
             if options.profile_stages:
                 usage["stage_timings_ms"] = (
                     per_request_timings[index]

@@ -33,6 +33,8 @@ _KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
 _KV_DIAGNOSTIC_RID_PREFIX = "sensenova-kvdiag-"
 _KV_TRANSFER_DIR = "SGLANG_SENSENOVA_KV_TRANSFER_DIR"
 _KV_TRANSFER_RID_PREFIX = "sensenova-kvxfer-"
+_KV_TRANSFER_REUSE_BUFFER = "SGLANG_SENSENOVA_KV_TRANSFER_REUSE_BUFFER"
+_KV_TRANSFER_MAX_TOKENS = "SGLANG_SENSENOVA_KV_TRANSFER_MAX_TOKENS"
 
 
 def _atomic_json_dump(payload: dict, path: Path) -> None:
@@ -41,7 +43,7 @@ def _atomic_json_dump(payload: dict, path: Path) -> None:
     os.replace(temporary, path)
 
 
-def _export_prefix_kv(
+def _export_prefix_kv_impl(
     output_dir: str,
     dump_id: str,
     token_ids: list[int],
@@ -59,13 +61,42 @@ def _export_prefix_kv(
     layer_shape = (first_keys.shape[1], length, first_keys.shape[2])
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    data_path = output / f"{dump_id}.bin"
-    temporary_data_path = output / f".{dump_id}.{os.getpid()}.bin.tmp"
     total_elements = len(layer_ids) * 2 * layer_shape[0] * length * layer_shape[2]
-    with open(temporary_data_path, "wb") as handle:
-        handle.truncate(total_elements * first_keys.element_size())
+    reuse_buffer = os.environ.get(_KV_TRANSFER_REUSE_BUFFER) == "1"
+    lock_path = None
+    if reuse_buffer:
+        max_tokens = int(os.environ.get(_KV_TRANSFER_MAX_TOKENS, "4096"))
+        if length > max_tokens:
+            raise RuntimeError(
+                f"SenseNova KV transfer length {length} exceeds {max_tokens}"
+            )
+        lock_path = output / "buffer.lock"
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # Batch-1 compact mode uses the reusable buffer. A concurrent request
+            # keeps correctness by falling back to its own one-shot file.
+            reuse_buffer = False
+            lock_path = None
+        else:
+            with os.fdopen(lock_fd, "w", encoding="utf-8") as handle:
+                handle.write(dump_id)
+            data_path = output / "buffer.bin"
+            buffer_elements = (
+                len(layer_ids) * 2 * layer_shape[0] * max_tokens * layer_shape[2]
+            )
+            buffer_bytes = buffer_elements * first_keys.element_size()
+            if not data_path.exists() or data_path.stat().st_size < buffer_bytes:
+                with open(data_path, "ab") as handle:
+                    handle.truncate(buffer_bytes)
+            mapping_path = data_path
+    if not reuse_buffer:
+        data_path = output / f"{dump_id}.bin"
+        mapping_path = output / f".{dump_id}.{os.getpid()}.bin.tmp"
+        with open(mapping_path, "wb") as handle:
+            handle.truncate(total_elements * first_keys.element_size())
     mapped = torch.from_file(
-        str(temporary_data_path),
+        str(mapping_path),
         shared=True,
         size=total_elements,
         dtype=first_keys.dtype,
@@ -114,7 +145,8 @@ def _export_prefix_kv(
 
     wall_ms = (time.perf_counter() - wall_started) * 1000
     del mapped
-    os.replace(temporary_data_path, data_path)
+    if not reuse_buffer:
+        os.replace(mapping_path, data_path)
     metadata = {
         "source": "srt",
         "dump_id": dump_id,
@@ -127,9 +159,32 @@ def _export_prefix_kv(
         "dtype": str(first_keys.dtype),
         "data_file": data_path.name,
         "data_bytes": total_elements * first_keys.element_size(),
+        "reuse_buffer": reuse_buffer,
+        "lock_file": lock_path.name if lock_path is not None else None,
         "timings_ms": {**timings, "wall": wall_ms},
     }
     _atomic_json_dump(metadata, output / f"{dump_id}.json")
+
+
+def _export_prefix_kv(
+    output_dir: str,
+    dump_id: str,
+    token_ids: list[int],
+    slots: torch.Tensor,
+    kv_pool,
+) -> None:
+    try:
+        _export_prefix_kv_impl(output_dir, dump_id, token_ids, slots, kv_pool)
+    except Exception:
+        output = Path(output_dir)
+        lock_path = output / "buffer.lock"
+        try:
+            if lock_path.read_text(encoding="utf-8") == dump_id:
+                lock_path.unlink()
+        except OSError:
+            pass
+        (output / f".{dump_id}.{os.getpid()}.bin.tmp").unlink(missing_ok=True)
+        raise
 
 
 def _understanding_weights(weights: Iterable[tuple[str, torch.Tensor]]):
