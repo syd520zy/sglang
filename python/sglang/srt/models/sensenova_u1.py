@@ -15,9 +15,12 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
-from sglang.srt.models.qwen3 import Qwen3Attention, Qwen3ForCausalLM
+from sglang.srt.models.qwen3 import (
+    Qwen3Attention,
+    Qwen3DecoderLayer,
+    Qwen3ForCausalLM,
+)
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda
 
@@ -115,7 +118,7 @@ class SenseNovaU1Attention(Qwen3Attention):
         return q, k, v
 
 
-class SenseNovaU1DecoderLayer(nn.Module):
+class SenseNovaU1DecoderLayer(Qwen3DecoderLayer):
     def __init__(
         self,
         config,
@@ -125,7 +128,7 @@ class SenseNovaU1DecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.self_attn = SenseNovaU1Attention(
             config,
@@ -146,7 +149,7 @@ class SenseNovaU1DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        scatter_modes = LayerScatterModes.init_new(
+        self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=False,
@@ -154,32 +157,9 @@ class SenseNovaU1DecoderLayer(nn.Module):
             is_next_layer_sparse=False,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=scatter_modes,
+            layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: torch.Tensor | None,
-        post_residual_addition: torch.Tensor | None = None,
-    ):
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            post_residual_addition=post_residual_addition,
-        )
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-        return self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
         )
 
 

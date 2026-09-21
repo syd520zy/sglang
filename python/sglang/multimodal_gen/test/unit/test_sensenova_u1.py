@@ -74,9 +74,6 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.srt_thinking import (
     ManagedSRTThinkingServer,
     SRTThinkingClient,
     ThinkingBackendStatus,
-    checked_dir,
-    checked_name,
-    contained_path,
     normalize_thinking_output_ids,
     prepare_managed_srt_thinking,
     runtime_files,
@@ -844,15 +841,19 @@ def test_sensenova_u1_think_mode_batching_requires_srt():
     assert scheduler._can_dynamic_batch(request, request)
 
 
-def test_sensenova_u1_external_srt_enables_thinking_batching():
+def test_sensenova_u1_external_srt_enables_thinking_batching(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_RUNTIME_DIR", str(tmp_path))
     config = SenseNovaU1PipelineConfig()
+    url = "http://127.0.0.1:31000"
+    ThinkingBackendStatus.for_url(url).mark_unavailable("previous run failed")
     server_args = SimpleNamespace(
         pipeline_config=config,
-        srt_encoder_url="http://127.0.0.1:31000",
+        srt_encoder_url=url,
     )
 
     assert prepare_managed_srt_thinking(server_args) is None
     assert config.srt_thinking_dynamic_batching
+    assert ThinkingBackendStatus.for_url(url).state.value == "starting"
 
 
 @pytest.mark.parametrize(
@@ -1503,9 +1504,9 @@ def test_sensenova_srt_thinking_client_uses_token_api(monkeypatch):
         return Response()
 
     monkeypatch.setattr("requests.post", post)
-    output_ids = SRTThinkingClient("http://127.0.0.1:1234", 3, 90).generate(
-        [1, 2], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
-    )
+    output_ids = SRTThinkingClient("http://127.0.0.1:1234", 3, 90).generate_batch(
+        [[1, 2]], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+    )[0]
 
     assert output_ids == [7, 9]
     assert request == {
@@ -1642,9 +1643,8 @@ def _thinking_status(tmp_path, *, strict, url="http://127.0.0.1:1234"):
     return ThinkingBackendStatus(
         url,
         strict=strict,
-        runtime_dir=str(tmp_path),
-        status_name="srt-thinking-test.json",
-        log_name="srt-thinking-test.log",
+        status_file=str(tmp_path / "srt-thinking-test.json"),
+        log_file=str(tmp_path / "srt-thinking-test.log"),
     )
 
 
@@ -1719,18 +1719,18 @@ def test_sensenova_thinking_client_never_retries_a_dead_backend(tmp_path, monkey
     status.mark_ready()
     client = SRTThinkingClient("http://127.0.0.1:1234", 3, 90, status=status)
 
-    assert client.available
+    assert client.status.state.value == "ready"
     with _capture_thinking_log() as handler:
         with pytest.raises(requests.ConnectionError):
-            client.generate(
-                [1], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+            client.generate_batch(
+                [[1]], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
             )
-        assert not client.available
+        assert client.status.state.value == "fallback"
         assert status.snapshot()["state"] == "fallback"
 
         with pytest.raises(RuntimeError, match="unavailable"):
-            client.generate(
-                [1], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+            client.generate_batch(
+                [[1]], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
             )
 
     assert calls == ["http://127.0.0.1:1234/generate"]
@@ -1755,12 +1755,11 @@ def test_sensenova_thinking_client_observes_parent_startup_failure(
     monkeypatch.setattr("requests.post", unexpected_post)
     with _capture_thinking_log() as handler:
         with pytest.raises(RuntimeError, match="unavailable"):
-            client.generate(
-                [1], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
+            client.generate_batch(
+                [[1]], max_think_tokens=4, eos_token_id=8, think_end_token_id=9
             )
         assert client.fail(RuntimeError("unavailable")) is False
 
-    assert not client.available
     assert client.status.state.value == "fallback"
     assert handler.messages == []
 
@@ -1805,20 +1804,17 @@ def test_sensenova_thinking_backend_info_reports_the_state(tmp_path, monkeypatch
     assert thinking_backend_info(server_args)["strict"] is False
 
 
-def test_sensenova_thinking_runtime_files_never_escape_the_directory(tmp_path):
-    root, status_name, log_name = runtime_files("http://127.0.0.1:1234")
+def test_sensenova_thinking_runtime_files_honor_the_log_override(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / "runtime"
+    log_file = tmp_path / "logs" / "srt.log"
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_LOG_FILE", str(log_file))
 
-    assert status_name.endswith(".json")
-    assert log_name.endswith(".log")
-    assert status_name != log_name
-    assert contained_path(root, log_name).startswith(root)
-    assert contained_path(str(tmp_path), log_name) == str(tmp_path / log_name)
+    status_file, actual_log_file = runtime_files("http://127.0.0.1:1234")
 
-    for unsafe in ("../srt.log", "nested/srt.log", "nested\\srt.log", "", os.pardir):
-        with pytest.raises(ValueError):
-            checked_name(unsafe)
-    with pytest.raises(ValueError):
-        checked_dir(os.path.join(str(tmp_path), os.pardir, "elsewhere"))
+    assert os.path.dirname(status_file) == str(runtime_dir)
+    assert status_file.endswith(".json")
+    assert actual_log_file == str(log_file)
 
 
 def test_sensenova_thinking_strict_mode_reads_the_environment(monkeypatch):
