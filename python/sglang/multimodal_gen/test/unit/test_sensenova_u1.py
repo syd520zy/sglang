@@ -100,7 +100,10 @@ from sglang.multimodal_gen.test.scripts.profile_sensenova_thinking_concurrency i
     summarize_wave,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.models.sensenova_u1 import _understanding_weights
+from sglang.srt.models.sensenova_u1 import NEOChatModel as SRTNEOChatModel
+from sglang.srt.models.sensenova_u1 import (
+    _understanding_weights,
+)
 
 
 class _FakeSenseNovaModel:
@@ -1558,6 +1561,69 @@ def test_sensenova_srt_thinking_client_batches_token_requests(monkeypatch):
     assert request["json"]["input_ids"] == [[1, 2], [3]]
 
 
+def test_sensenova_srt_client_requests_diagnostic_prefix(monkeypatch, tmp_path):
+    request = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    def post(url, **kwargs):
+        request.update(url=url, **kwargs)
+        return Response()
+
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR", str(tmp_path))
+    monkeypatch.setattr("requests.post", post)
+    SRTThinkingClient("http://127.0.0.1:1234", 3, 90).dump_prefix_kv(
+        [1, 2, 3], "abc123"
+    )
+
+    assert request == {
+        "url": "http://127.0.0.1:1234/generate",
+        "json": {
+            "rid": "sensenova-kvdiag-abc123",
+            "input_ids": [1, 2, 3],
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 1,
+                "skip_special_tokens": False,
+            },
+        },
+        "timeout": (3, 90),
+    }
+
+
+def test_sensenova_srt_worker_dumps_committed_nhd_kv(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR", str(tmp_path))
+    keys = torch.arange(60, dtype=torch.bfloat16).reshape(10, 2, 3)
+    values = keys + 100
+    pool = SimpleNamespace(
+        kv_cache_layout="nhd",
+        is_quantized_kv_cache=False,
+        start_layer=0,
+        get_kv_buffer=lambda _layer_id: (keys, values),
+    )
+    req = SimpleNamespace(
+        rid="sensenova-kvdiag-abc123",
+        origin_input_ids=[11, 12],
+        output_ids=[13],
+        kv=SimpleNamespace(holds_kv=True, kv_committed_len=2, req_pool_idx=0),
+    )
+    req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([[3, 5, 0]], dtype=torch.long)
+    )
+    allocator = SimpleNamespace(get_kvcache=lambda: pool)
+
+    SRTNEOChatModel.prepare_for_kv_cache_release(
+        None, req, req_to_token_pool, allocator
+    )
+
+    payload = torch.load(tmp_path / "abc123-srt.pt", weights_only=True)
+    assert payload["token_ids"] == [11, 12]
+    torch.testing.assert_close(payload["keys"], keys[[3, 5]].transpose(0, 1))
+    torch.testing.assert_close(payload["values"], values[[3, 5]].transpose(0, 1))
+
+
 def test_sensenova_srt_replay_pads_after_each_complete_prefix():
     captured = {}
 
@@ -1602,6 +1668,57 @@ def test_sensenova_srt_replay_pads_after_each_complete_prefix():
         [True, True, True, True, True, True, False],
     ]
     assert lengths.tolist() == [7, 6]
+
+
+def test_sensenova_srt_replay_dumps_matching_native_prefix(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR", str(tmp_path))
+    captured = {}
+    cache = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                keys=torch.arange(36, dtype=torch.bfloat16).reshape(1, 2, 6, 3),
+                values=torch.arange(36, dtype=torch.bfloat16).reshape(1, 2, 6, 3) + 100,
+            )
+        ]
+    )
+
+    def prefix_forward(input_ids, _indexes, _attention_mask):
+        return cache, torch.zeros((*input_ids.shape, 4))
+
+    class Backend:
+        def dump_prefix_kv(self, input_ids, dump_id):
+            captured.update(input_ids=input_ids, dump_id=dump_id)
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        _t2i_prefix_forward=prefix_forward,
+    )
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.tensor([[20, 21]])}
+
+    tokenizer = Tokenizer()
+
+    NEOChatModel._replay_srt_think_prefix(
+        model,
+        tokenizer,
+        torch.tensor([[1, 2]]),
+        torch.tensor([2]),
+        [[7, 9]],
+        "<img>",
+        Backend(),
+    )
+
+    assert captured["input_ids"] == [1, 2, 7, 9, 20, 21]
+    payload = torch.load(
+        tmp_path / f"{captured['dump_id']}-native.pt", weights_only=True
+    )
+    assert payload["token_ids"] == captured["input_ids"]
+    assert payload["keys"].shape == (2, 6, 3)
 
 
 class _DeadSRTProcess:

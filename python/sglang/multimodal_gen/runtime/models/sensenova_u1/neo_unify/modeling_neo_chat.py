@@ -1,9 +1,11 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
 import contextlib
+import hashlib
 import math
 import os
 import time
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
@@ -37,6 +39,30 @@ from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 
 logger = logging.get_logger(__name__)
+
+_KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
+
+
+def _token_ids_sha256(token_ids: list[int]) -> str:
+    return hashlib.sha256(",".join(map(str, token_ids)).encode()).hexdigest()
+
+
+def _dump_native_prefix_kv(cache, token_ids: list[int], dump_id: str) -> None:
+    output_dir = os.environ.get(_KV_DIAGNOSTIC_DIR)
+    if not output_dir:
+        return
+    layer = cache.layers[0]
+    payload = {
+        "source": "native",
+        "layer_id": 0,
+        "token_ids": token_ids,
+        "token_sha256": _token_ids_sha256(token_ids),
+        "keys": layer.keys[0, :, : len(token_ids), :].contiguous().cpu(),
+        "values": layer.values[0, :, : len(token_ids), :].contiguous().cpu(),
+    }
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path / f"{dump_id}-native.pt")
 
 
 class _SenseNovaPreallocatedLayer(DynamicLayer):
@@ -866,6 +892,7 @@ class NEOChatModel(PreTrainedModel):
         prefix_lengths,
         think_token_ids,
         IMG_START_TOKEN,
+        thinking_backend=None,
     ):
         append_ids = tokenizer(
             "\n\n" + IMG_START_TOKEN,
@@ -891,6 +918,23 @@ class NEOChatModel(PreTrainedModel):
             dtype=torch.long,
             device=input_ids.device,
         )
+        diagnostic_dir = os.environ.get(_KV_DIAGNOSTIC_DIR)
+        diagnostic_id = None
+        diagnostic_token_ids = None
+        if diagnostic_dir:
+            if len(replay_rows) != 1:
+                raise RuntimeError(
+                    "SenseNova KV diagnostic currently supports batch size 1"
+                )
+            if thinking_backend is None or not hasattr(
+                thinking_backend, "dump_prefix_kv"
+            ):
+                raise RuntimeError(
+                    "SenseNova KV diagnostic requires the managed SRT backend"
+                )
+            diagnostic_token_ids = replay_rows[0].tolist()
+            diagnostic_id = _token_ids_sha256(diagnostic_token_ids)[:16]
+            thinking_backend.dump_prefix_kv(diagnostic_token_ids, diagnostic_id)
         max_length = int(replay_lengths.max().item())
         pad_token_id = getattr(tokenizer, "pad_token_id", None)
         if pad_token_id is None:
@@ -922,6 +966,8 @@ class NEOChatModel(PreTrainedModel):
         cache, hidden_states = self._t2i_prefix_forward(
             replay_ids, indexes, attention_mask
         )
+        if diagnostic_id is not None:
+            _dump_native_prefix_kv(cache, diagnostic_token_ids, diagnostic_id)
         return cache, hidden_states, indexes, key_valid_mask, replay_lengths
 
     def _generate_think(
@@ -2739,6 +2785,7 @@ class NEOChatModel(PreTrainedModel):
                         condition_prefix_lengths,
                         think_token_ids,
                         IMG_START_TOKEN,
+                        thinking_backend,
                     )
                     device = prefix_hidden_states.device
                     dtype = prefix_hidden_states.dtype

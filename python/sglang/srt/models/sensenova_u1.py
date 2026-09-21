@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """SRT text-only runtime for SenseNova-U1 thinking decode."""
 
+import hashlib
+import os
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -23,6 +26,9 @@ from sglang.srt.models.qwen3 import (
 )
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda
+
+_KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
+_KV_DIAGNOSTIC_RID_PREFIX = "sensenova-kvdiag-"
 
 
 def _understanding_weights(weights: Iterable[tuple[str, torch.Tensor]]):
@@ -208,6 +214,50 @@ class NEOChatModel(Qwen3ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return super().load_weights(_understanding_weights(weights))
+
+    def prepare_for_kv_cache_release(
+        self, req, req_to_token_pool, token_to_kv_pool_allocator
+    ) -> None:
+        """Dump one finalized prefix layer for the opt-in KV compatibility check."""
+        output_dir = os.environ.get(_KV_DIAGNOSTIC_DIR)
+        if (
+            not output_dir
+            or not isinstance(req.rid, str)
+            or not req.rid.startswith(_KV_DIAGNOSTIC_RID_PREFIX)
+        ):
+            return
+        dump_id = req.rid.removeprefix(_KV_DIAGNOSTIC_RID_PREFIX)
+        if not dump_id or not dump_id.isascii() or not dump_id.isalnum():
+            raise ValueError(f"invalid SenseNova KV diagnostic id: {dump_id!r}")
+        if not req.kv.holds_kv or req.kv.kv_committed_len <= 0:
+            raise RuntimeError("SenseNova KV diagnostic request has no committed KV")
+
+        kv_pool = token_to_kv_pool_allocator.get_kvcache()
+        if getattr(kv_pool, "kv_cache_layout", None) != "nhd":
+            raise RuntimeError("SenseNova KV diagnostic requires an NHD KV cache")
+        if getattr(kv_pool, "is_quantized_kv_cache", False):
+            raise RuntimeError("SenseNova KV diagnostic requires an unquantized cache")
+
+        length = req.kv.kv_committed_len
+        slots = req_to_token_pool.req_to_token[req.kv.req_pool_idx, :length]
+        layer_id = kv_pool.start_layer
+        keys, values = kv_pool.get_kv_buffer(layer_id)
+        token_ids = list(req.origin_input_ids) + list(req.output_ids)
+        token_ids = [int(token_id) for token_id in token_ids[:length]]
+        token_sha256 = hashlib.sha256(
+            ",".join(map(str, token_ids)).encode()
+        ).hexdigest()
+        payload = {
+            "source": "srt",
+            "layer_id": layer_id,
+            "token_ids": token_ids,
+            "token_sha256": token_sha256,
+            "keys": keys[slots].transpose(0, 1).contiguous().cpu(),
+            "values": values[slots].transpose(0, 1).contiguous().cpu(),
+        }
+        path = Path(output_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path / f"{dump_id}-srt.pt")
 
 
 EntryClass = NEOChatModel

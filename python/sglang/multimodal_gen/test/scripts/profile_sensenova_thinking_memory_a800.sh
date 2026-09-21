@@ -7,11 +7,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-MODEL_PATH="${MODEL_PATH:-sensenova/SenseNova-U1.5-8B-MoT}"
+if [[ -z "${MODEL_PATH:-}" ]]; then
+  MODEL_PATH="/model/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT"
+  if [[ ! -d "${MODEL_PATH}" ]]; then
+    MODEL_PATH="sensenova/SenseNova-U1.5-8B-MoT"
+  fi
+fi
 GPU_ID="${GPU_ID:-0}"
 STEPS="${STEPS:-1}"
 RESULT_ROOT="${OUTPUT_DIR:-/workspace/sensenova-thinking-memory/$(date +%Y%m%d-%H%M%S)}"
 RESULT_ROOT="$(mkdir -p "${RESULT_ROOT}" && cd "${RESULT_ROOT}" && pwd)"
+exec > >(tee -a "${RESULT_ROOT}/run.log") 2>&1
+trap 'status=$?; echo "FAILED (${status}) at line ${LINENO}: ${BASH_COMMAND}"' ERR
+
+echo "Repository: ${REPO_ROOT}"
+echo "Results: ${RESULT_ROOT}"
+echo "Commit: $(git rev-parse HEAD)"
+echo "Model: ${MODEL_PATH}"
 
 python "${SCRIPT_DIR}/analyze_sensenova_checkpoint_memory.py" \
   --model "${MODEL_PATH}" \

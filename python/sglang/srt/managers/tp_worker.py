@@ -116,6 +116,15 @@ class BaseTpWorker(ABC):
             self.model_runner.swa_max_total_num_tokens,
         )
 
+    def prepare_for_kv_cache_release(self, req) -> None:
+        hook = getattr(self.model_runner.model, "prepare_for_kv_cache_release", None)
+        if callable(hook):
+            hook(
+                req,
+                self.model_runner.req_to_token_pool,
+                self.model_runner.token_to_kv_pool_allocator,
+            )
+
     @property
     def graph_memory_usage(self) -> dict[str, float]:
         runners = self.model_runner_list or [self.model_runner]

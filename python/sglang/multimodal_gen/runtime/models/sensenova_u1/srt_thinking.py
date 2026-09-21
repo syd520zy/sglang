@@ -25,8 +25,10 @@ _ENV_BACKEND = "SGLANG_SENSENOVA_THINKING_BACKEND"
 _ENV_STRICT = "SGLANG_SENSENOVA_THINKING_STRICT"
 _ENV_RUNTIME_DIR = "SGLANG_SENSENOVA_THINKING_RUNTIME_DIR"
 _ENV_LOG_FILE = "SGLANG_SENSENOVA_THINKING_LOG_FILE"
+_ENV_KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
 _DEFAULT_RUNTIME_DIRNAME = "sglang-sensenova-thinking"
 _STARTUP_DEADLINE_S = 600.0
+_KV_DIAGNOSTIC_RID_PREFIX = "sensenova-kvdiag-"
 
 
 class ThinkingBackendState(str, Enum):
@@ -302,6 +304,29 @@ class SRTThinkingClient:
             )
             for item in output_ids
         ]
+
+    def dump_prefix_kv(self, input_ids: list[int], dump_id: str) -> None:
+        """Prefill one finalized replay prefix so SRT can dump diagnostic KV."""
+        if not os.environ.get(_ENV_KV_DIAGNOSTIC_DIR):
+            return
+        try:
+            response = requests.post(
+                f"{self.url}/generate",
+                json={
+                    "rid": f"{_KV_DIAGNOSTIC_RID_PREFIX}{dump_id}",
+                    "input_ids": input_ids,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 1,
+                        "skip_special_tokens": False,
+                    },
+                },
+                timeout=(self.connect_timeout, self.timeout),
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            self.fail(exc)
+            raise
 
     def fail(self, exc: BaseException) -> bool:
         """Mark SRT unusable; True when this was its first failure on this client."""
