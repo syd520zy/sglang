@@ -27,6 +27,8 @@ _ENV_RUNTIME_DIR = "SGLANG_SENSENOVA_THINKING_RUNTIME_DIR"
 _ENV_LOG_FILE = "SGLANG_SENSENOVA_THINKING_LOG_FILE"
 _ENV_KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
 _ENV_KV_TRANSFER_DIR = "SGLANG_SENSENOVA_KV_TRANSFER_DIR"
+_ENV_USE_KV_TRANSFER = "SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER"
+_ENV_COMPACT_MODE = "SGLANG_SENSENOVA_COMPACT_MODE"
 _DEFAULT_RUNTIME_DIRNAME = "sglang-sensenova-thinking"
 _STARTUP_DEADLINE_S = 600.0
 _KV_DIAGNOSTIC_RID_PREFIX = "sensenova-kvdiag-"
@@ -46,7 +48,42 @@ _SRT_SERVING_STATES = (ThinkingBackendState.STARTING, ThinkingBackendState.READY
 
 
 def thinking_strict_enabled() -> bool:
-    return os.environ.get(_ENV_STRICT, "").strip().lower() in ("1", "true", "yes", "on")
+    return compact_mode_enabled() or os.environ.get(
+        _ENV_STRICT, ""
+    ).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def compact_mode_enabled() -> bool:
+    return os.environ.get(_ENV_COMPACT_MODE, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _configure_compact_mode(server_args) -> None:
+    if not compact_mode_enabled():
+        return
+    if server_args.srt_encoder_url:
+        raise ValueError(
+            "SenseNova compact mode currently requires the managed local SRT backend"
+        )
+    if os.environ.get(_ENV_BACKEND, "srt").lower() != "srt":
+        raise ValueError(f"{_ENV_COMPACT_MODE}=1 requires {_ENV_BACKEND}=srt")
+    runtime_root = os.path.abspath(
+        os.environ.get(_ENV_RUNTIME_DIR)
+        or os.path.join(tempfile.gettempdir(), _DEFAULT_RUNTIME_DIRNAME)
+    )
+    os.environ[_ENV_USE_KV_TRANSFER] = "1"
+    os.environ.setdefault(
+        _ENV_KV_TRANSFER_DIR, os.path.join(runtime_root, "kv-transfer")
+    )
 
 
 def runtime_files(url: str) -> tuple[str, str]:
@@ -675,6 +712,7 @@ def prepare_managed_srt_thinking(server_args):
     """Reserve the internal text runtime before diffusion workers are spawned."""
     if not _is_sensenova_pipeline(server_args):
         return None
+    _configure_compact_mode(server_args)
     pipeline_config = server_args.pipeline_config
     pipeline_config.srt_thinking_dynamic_batching = bool(server_args.srt_encoder_url)
     if server_args.srt_encoder_url:

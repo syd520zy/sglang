@@ -1067,6 +1067,7 @@ class NEOChatModel(PreTrainedModel):
         IMG_START_TOKEN,
         thinking_backend=None,
         transfer_context=None,
+        require_transfer=False,
     ):
         append_ids = tokenizer(
             "\n\n" + IMG_START_TOKEN,
@@ -1159,10 +1160,18 @@ class NEOChatModel(PreTrainedModel):
                 self.last_srt_kv_transferred_prefixes.append("condition")
             except Exception as exc:
                 self.last_srt_kv_transfer_used = False
+                if require_transfer:
+                    raise RuntimeError(
+                        "SenseNova compact mode requires SRT prefix KV transfer"
+                    ) from exc
                 logger.warning(
                     "SenseNova SRT KV transfer failed; replaying the prefix: %s", exc
                 )
         if cache is None:
+            if require_transfer:
+                raise RuntimeError(
+                    "SenseNova compact mode did not receive the condition prefix KV"
+                )
             cache, hidden_states = self._t2i_prefix_forward(
                 replay_ids, indexes, attention_mask
             )
@@ -2414,6 +2423,10 @@ class NEOChatModel(PreTrainedModel):
         seed=0,
         max_think_tokens=1024,
     ):
+        if getattr(self, "_sensenova_compact_mode", False):
+            raise RuntimeError(
+                "SenseNova compact mode currently supports text-to-image only"
+            )
         assert cfg_norm in ["none", "global", "channel"]
         self._notify_layer_offload_phase("prefix")
 
@@ -2895,6 +2908,12 @@ class NEOChatModel(PreTrainedModel):
             and thinking_backend is not None
             and hasattr(thinking_backend, "transfer_prefix_kv")
         )
+        compact_mode = getattr(self, "_sensenova_compact_mode", False)
+        if compact_mode and not use_direct_srt_prefix:
+            raise RuntimeError(
+                "SenseNova compact mode requires one T2I prompt and the managed "
+                "SRT prefix KV transfer backend"
+            )
         self._notify_layer_offload_phase("prefix")
         merge_size = int(1 / self.downsample_ratio)
 
@@ -3003,6 +3022,7 @@ class NEOChatModel(PreTrainedModel):
                         IMG_START_TOKEN,
                         thinking_backend,
                         transfer_context,
+                        require_transfer=compact_mode,
                     )
                     first_cache_layer = past_key_values_condition.layers[0]
                     device = first_cache_layer.keys.device
@@ -3018,7 +3038,7 @@ class NEOChatModel(PreTrainedModel):
                     if hasattr(thinking_backend, "close_transfer_context"):
                         thinking_backend.close_transfer_context(transfer_context)
                     first_failure = thinking_backend.fail(exc)
-                    if thinking_backend.strict:
+                    if compact_mode or thinking_backend.strict:
                         # Benchmarks and CI require SRT; never measure the fallback.
                         raise
                     if len(prompts) > 1:
@@ -3091,6 +3111,11 @@ class NEOChatModel(PreTrainedModel):
                     self.last_srt_kv_transferred_prefixes.append("condition")
                 else:
                     use_direct_srt_prefix = False
+                    if compact_mode:
+                        raise RuntimeError(
+                            "SenseNova compact mode did not receive the condition "
+                            "prefix KV"
+                        )
             if past_key_values_condition is None:
                 (
                     past_key_values_condition,
@@ -3127,6 +3152,10 @@ class NEOChatModel(PreTrainedModel):
                     self.last_srt_kv_transferred_prefixes.append("uncondition")
                     self.last_srt_kv_transfer_timings["uncondition"] = (
                         uncondition_transfer_timings
+                    )
+                elif compact_mode:
+                    raise RuntimeError(
+                        "SenseNova compact mode did not receive the CFG prefix KV"
                     )
             if past_key_values_uncondition is None:
                 past_key_values_uncondition, _ = self._t2i_prefix_forward(

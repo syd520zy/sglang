@@ -45,6 +45,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.sensenova_u1 import srt_thinking
+from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
+    _prune_for_compact_t2i,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
@@ -2097,6 +2100,19 @@ def test_sensenova_srt_kv_transfer_failure_replays_prefix(monkeypatch, tmp_path)
     assert hidden.shape == (1, 6, 4)
     assert model.last_srt_kv_transfer_used is False
 
+    with pytest.raises(RuntimeError, match="requires SRT prefix KV transfer"):
+        NEOChatModel._replay_srt_think_prefix(
+            model,
+            Tokenizer(),
+            torch.tensor([[1, 2]]),
+            torch.tensor([2]),
+            [[7, 9]],
+            "<img>",
+            Backend(),
+            {"session_id": "session-1"},
+            require_transfer=True,
+        )
+
 
 def test_sensenova_srt_replay_dumps_matching_native_prefix(monkeypatch, tmp_path):
     monkeypatch.setenv("SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR", str(tmp_path))
@@ -2354,6 +2370,66 @@ def test_sensenova_thinking_backend_info_reports_the_state(tmp_path, monkeypatch
     assert thinking_backend_info(server_args)["strict"] is True
     monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_STRICT", "0")
     assert thinking_backend_info(server_args)["strict"] is False
+
+
+def test_sensenova_compact_mode_configures_strict_local_kv_transfer(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SGLANG_SENSENOVA_COMPACT_MODE", "1")
+    monkeypatch.setenv("SGLANG_SENSENOVA_THINKING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER", raising=False)
+    monkeypatch.delenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", raising=False)
+
+    srt_thinking._configure_compact_mode(SimpleNamespace(srt_encoder_url=None))
+
+    assert thinking_strict_enabled()
+    assert os.environ["SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER"] == "1"
+    assert os.environ["SGLANG_SENSENOVA_KV_TRANSFER_DIR"] == str(
+        tmp_path / "kv-transfer"
+    )
+
+
+def test_sensenova_compact_mode_prunes_only_dense_language_weights():
+    model = torch.nn.Module()
+    model.language_model = torch.nn.Module()
+    model.language_model.model = torch.nn.Module()
+    model.language_model.model.embed_tokens = torch.nn.Embedding(4, 2)
+    model.language_model.model.norm = torch.nn.LayerNorm(2)
+    layer = torch.nn.Module()
+    layer.self_attn = torch.nn.Module()
+    for name in (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_norm",
+        "q_norm_hw",
+        "k_norm",
+        "k_norm_hw",
+        "q_proj_mot_gen",
+    ):
+        setattr(layer.self_attn, name, torch.nn.Linear(2, 2, bias=False))
+    for name in (
+        "mlp",
+        "input_layernorm",
+        "post_attention_layernorm",
+        "mlp_mot_gen",
+    ):
+        setattr(layer, name, torch.nn.Linear(2, 2, bias=False))
+    model.language_model.model.layers = torch.nn.ModuleList([layer])
+    model.language_model.lm_head = torch.nn.Linear(2, 4, bias=False)
+
+    released = _prune_for_compact_t2i(model)
+
+    assert released > 0
+    assert model._sensenova_compact_mode is True
+    assert model.language_model.model.embed_tokens is not None
+    assert model.language_model.model.norm is None
+    assert model.language_model.lm_head is None
+    assert layer.mlp is None
+    assert layer.mlp_mot_gen is not None
+    assert layer.self_attn.q_proj is None
+    assert layer.self_attn.q_proj_mot_gen is not None
 
 
 def test_sensenova_thinking_runtime_files_honor_the_log_override(tmp_path, monkeypatch):
