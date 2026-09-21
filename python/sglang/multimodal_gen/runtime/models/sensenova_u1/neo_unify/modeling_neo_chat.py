@@ -1232,7 +1232,8 @@ class NEOChatModel(PreTrainedModel):
                 self.last_srt_kv_transfer_used = True
                 self.last_srt_kv_transferred_prefixes.append("condition")
             except Exception as exc:
-                thinking_backend.close_transfer_context(transfer_contexts)
+                if hasattr(thinking_backend, "close_transfer_context"):
+                    thinking_backend.close_transfer_context(transfer_contexts)
                 self.last_srt_kv_transfer_used = False
                 if require_transfer:
                     raise RuntimeError(
