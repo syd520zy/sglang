@@ -1877,13 +1877,18 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
     config = NEOLLMConfig(
         hidden_size=8,
         intermediate_size=16,
-        num_hidden_layers=1,
+        num_hidden_layers=2,
         num_attention_heads=2,
         num_key_value_heads=2,
         head_dim=4,
         max_position_embeddings=32,
     )
-    exported = torch.arange(96, dtype=torch.bfloat16).reshape(1, 2, 2, 6, 4)
+    exported = torch.arange(192, dtype=torch.bfloat16).reshape(2, 2, 2, 6, 4)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."
+        "modeling_neo_chat._KV_IMPORT_PINNED_CHUNK_BYTES",
+        exported[0].numel() * exported.element_size(),
+    )
 
     class Backend:
         def transfer_prefix_kv(self, token_ids, dump_id, session_context):
@@ -1905,7 +1910,7 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
                 "token_sha256": hashlib.sha256(
                     ",".join(map(str, token_ids)).encode()
                 ).hexdigest(),
-                "layer_ids": [0],
+                "layer_ids": [0, 1],
                 "shape": list(exported.shape),
                 "dtype": "torch.bfloat16",
                 "data_file": "buffer.bin",
@@ -1954,8 +1959,10 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
 
     assert hidden is None
     assert model.last_srt_kv_transfer_used is True
-    torch.testing.assert_close(cache.layers[0].keys, exported[:, 0])
-    torch.testing.assert_close(cache.layers[0].values, exported[:, 1])
+    torch.testing.assert_close(cache.layers[0].keys, exported[0:1, 0])
+    torch.testing.assert_close(cache.layers[0].values, exported[0:1, 1])
+    torch.testing.assert_close(cache.layers[1].keys, exported[1:2, 0])
+    torch.testing.assert_close(cache.layers[1].values, exported[1:2, 1])
     assert not (tmp_path / "buffer.lock").exists()
 
 

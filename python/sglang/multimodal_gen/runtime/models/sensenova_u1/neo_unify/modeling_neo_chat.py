@@ -43,6 +43,7 @@ logger = logging.get_logger(__name__)
 _KV_DIAGNOSTIC_DIR = "SGLANG_SENSENOVA_KV_DIAGNOSTIC_DIR"
 _KV_TRANSFER_DIR = "SGLANG_SENSENOVA_KV_TRANSFER_DIR"
 _USE_SRT_KV_TRANSFER = "SGLANG_SENSENOVA_USE_SRT_KV_TRANSFER"
+_KV_IMPORT_PINNED_CHUNK_BYTES = 64 * 1024**2
 
 
 def _token_ids_sha256(token_ids: list[int]) -> str:
@@ -104,9 +105,8 @@ def _load_srt_prefix_kv(
             )
         if metadata.get("token_sha256") != _token_ids_sha256(token_ids):
             raise RuntimeError("SenseNova SRT KV token hash does not match")
-        expected_bytes = (
-            math.prod(shape) * torch.empty((), dtype=torch.bfloat16).element_size()
-        )
+        element_size = torch.empty((), dtype=torch.bfloat16).element_size()
+        expected_bytes = math.prod(shape) * element_size
         if metadata.get("data_bytes") != expected_bytes:
             raise RuntimeError("SenseNova SRT KV metadata has an invalid byte count")
         if data_path.stat().st_size < expected_bytes:
@@ -119,24 +119,41 @@ def _load_srt_prefix_kv(
             dtype=torch.bfloat16,
         ).view(shape)
         pin_memory = device.type == "cuda"
+        layer_bytes = math.prod(shape[1:]) * element_size
+        layers_per_chunk = max(
+            1,
+            min(shape[0], _KV_IMPORT_PINNED_CHUNK_BYTES // layer_bytes),
+        )
         pinned = torch.empty(
-            (2, *shape[2:]), dtype=torch.bfloat16, pin_memory=pin_memory
+            (layers_per_chunk, *shape[1:]),
+            dtype=torch.bfloat16,
+            pin_memory=pin_memory,
         )
         cache = DynamicCache(config=config)
         shared_to_pinned_ms = 0.0
         h2d_ms = 0.0
         wall_started = time.perf_counter()
-        for layer in range(shape[0]):
+        for chunk_start in range(0, shape[0], layers_per_chunk):
+            chunk_end = min(chunk_start + layers_per_chunk, shape[0])
+            chunk_layers = chunk_end - chunk_start
             stage_started = time.perf_counter()
-            pinned.copy_(mapped[layer])
+            pinned[:chunk_layers].copy_(mapped[chunk_start:chunk_end])
             shared_to_pinned_ms += (time.perf_counter() - stage_started) * 1000
             stage_started = time.perf_counter()
-            keys = pinned[0].unsqueeze(0).to(device, non_blocking=pin_memory)
-            values = pinned[1].unsqueeze(0).to(device, non_blocking=pin_memory)
+            for chunk_layer in range(chunk_layers):
+                layer = chunk_start + chunk_layer
+                keys = pinned[chunk_layer, 0].unsqueeze(0)
+                values = pinned[chunk_layer, 1].unsqueeze(0)
+                if pin_memory:
+                    keys = keys.to(device, non_blocking=True)
+                    values = values.to(device, non_blocking=True)
+                else:
+                    keys = keys.clone()
+                    values = values.clone()
+                cache.update(keys, values, layer)
             if pin_memory:
                 torch.cuda.synchronize(device)
             h2d_ms += (time.perf_counter() - stage_started) * 1000
-            cache.update(keys, values, layer)
         timings = {
             "shared_to_pinned": shared_to_pinned_ms,
             "h2d": h2d_ms,
