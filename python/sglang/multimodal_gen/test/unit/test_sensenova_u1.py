@@ -1925,6 +1925,13 @@ def test_sensenova_srt_replay_builds_cache_from_transfer(monkeypatch, tmp_path):
         last_srt_kv_transferred_prefixes=[],
     )
 
+    def import_prefix(backend, token_ids, context):
+        return NEOChatModel._import_srt_prefix_tokens(
+            model, backend, token_ids, context
+        )
+
+    model._import_srt_prefix_tokens = import_prefix
+
     class Tokenizer:
         pad_token_id = 0
         eos_token_id = 2
